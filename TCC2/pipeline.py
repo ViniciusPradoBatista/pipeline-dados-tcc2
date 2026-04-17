@@ -194,12 +194,28 @@ def detect_platform(meta_df: pd.DataFrame) -> Tuple[str, str]:
     return platform_id, platform_name
 
 
-def smart_float(x: object) -> float:
-    """Converte string → float tratando NA, vírgula-milhar, aspas."""
+def smart_float(x: object, broken_decimal: bool = False) -> float:
+    """Converte string → float tratando NA, aspas e formato locale-quebrado.
+
+    Quando `broken_decimal=True`, o arquivo exportou os dígitos concatenados
+    com pontos inseridos como separador de milhar (ex.: valor real
+    `1.129491157` aparece como `1.129.491.157`; valor real `5.97201`
+    aparece como `597.201`). Regra de reconstrução: strip de todos os
+    pontos, o primeiro dígito vira a parte inteira e o resto a decimal.
+    """
     s = str(x).strip().strip('"')
     if s == "" or s.lower() in {"na", "nan", "null", "none", "--", "n/a"}:
         return np.nan
-    # GEO Series Matrix sempre usa ponto decimal – elimina vírgulas residuais
+
+    if broken_decimal:
+        sign = -1.0 if s.startswith("-") else 1.0
+        digits = s.lstrip("-").replace(".", "").replace(",", "")
+        if not digits.isdigit():
+            return np.nan
+        if len(digits) <= 1:
+            return sign * float(digits)
+        return sign * float(digits[0] + "." + digits[1:])
+
     s = s.replace(",", "")
     try:
         return float(s)
@@ -207,10 +223,38 @@ def smart_float(x: object) -> float:
         return np.nan
 
 
+def _detect_broken_decimal_format(path: Path, encoding: str) -> bool:
+    """Detecta formato locale-quebrado (dígitos com >1 ponto) no arquivo.
+
+    Retorna True se a amostra inicial de valores numéricos contém algum
+    valor com mais de um ponto — sinal inequívoco de export com
+    separador-de-milhar em dot-locale aplicado ao stream de dígitos.
+    """
+    found_header = False
+    scanned = 0
+    with open(path, "r", encoding=encoding, errors="ignore") as f:
+        for line in f:
+            if not found_header:
+                if "ID_REF" in line:
+                    found_header = True
+                continue
+            if line.startswith("!"):
+                break
+            for v in line.rstrip().split("\t")[1:]:
+                v = v.strip().strip('"')
+                if v.count(".") > 1:
+                    return True
+            scanned += 1
+            if scanned >= 100:
+                break
+    return False
+
+
 def read_expression_from_txt(path: Path) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
     """Lê a matriz de expressão do Series Matrix.
 
     Retorna (expr_text, expr_num, gsm_cols) – SEM aplicar log2.
+    Detecta automaticamente export com formato locale-quebrado.
     """
     enc = detect_encoding(path)
     header_idx: Optional[int] = None
@@ -221,6 +265,11 @@ def read_expression_from_txt(path: Path) -> Tuple[pd.DataFrame, pd.DataFrame, Li
                 break
     if header_idx is None:
         raise ValueError(f"Cabeçalho ID_REF não encontrado em {path}")
+
+    broken = _detect_broken_decimal_format(path, enc)
+    if broken:
+        logger.warning("[parse] formato locale-quebrado detectado em %s "
+                       "— aplicando reconstrução dígito-a-dígito", path.name)
 
     df = pd.read_csv(
         path, sep="\t", skiprows=header_idx, header=0,
@@ -235,10 +284,11 @@ def read_expression_from_txt(path: Path) -> Tuple[pd.DataFrame, pd.DataFrame, Li
     expr_text = df[["Probe_ID"] + gsm_cols].copy()
     expr_num = expr_text.copy()
     for c in gsm_cols:
-        expr_num[c] = expr_num[c].apply(smart_float)
+        expr_num[c] = expr_num[c].apply(lambda v: smart_float(v, broken_decimal=broken))
 
-    logger.info("Expressão carregada: %d probes × %d amostras",
-                expr_num.shape[0], len(gsm_cols))
+    nan_frac = expr_num[gsm_cols].isna().to_numpy().mean()
+    logger.info("Expressão carregada: %d probes × %d amostras (NaN frac=%.4f)",
+                expr_num.shape[0], len(gsm_cols), nan_frac)
     return expr_text, expr_num, gsm_cols
 
 
@@ -499,8 +549,24 @@ def prepare_merge_ready(
 
 
 # ========================================================================
-# 5. Z-score por probe
+# 5. Imputação e Z-score por probe
 # ========================================================================
+def impute_by_probe_median(expr_df: pd.DataFrame) -> pd.DataFrame:
+    """Imputa NaN com a mediana do probe (linha). Preserva índice/colunas."""
+    values = expr_df.to_numpy(dtype=float)
+    medians = np.nanmedian(values, axis=1, keepdims=True)
+    mask = np.isnan(values)
+    if not mask.any():
+        return expr_df
+    # Probes totalmente NaN: preenche com 0 (fallback neutro)
+    medians = np.where(np.isnan(medians), 0.0, medians)
+    filled = np.where(mask, np.broadcast_to(medians, values.shape), values)
+    out = pd.DataFrame(filled, index=expr_df.index, columns=expr_df.columns)
+    n_filled = int(mask.sum())
+    logger.info("[impute] %d células NaN preenchidas com mediana do probe", n_filled)
+    return out
+
+
 def zscore_by_probe(expr_df: pd.DataFrame) -> pd.DataFrame:
     """z = (x - mean_row) / std_row, NaN-safe, dropa probes com std=0."""
     values = expr_df.to_numpy(dtype=float)
@@ -509,7 +575,6 @@ def zscore_by_probe(expr_df: pd.DataFrame) -> pd.DataFrame:
     with np.errstate(invalid="ignore", divide="ignore"):
         z = (values - mean) / std
     z_df = pd.DataFrame(z, index=expr_df.index, columns=expr_df.columns)
-    # Remove linhas totalmente NaN (std == 0 ⇒ inf) ou std==0
     finite_std = np.squeeze(std) > 0
     z_df = z_df.loc[finite_std]
     logger.info("[z-score] %d probes mantidos (std>0)", z_df.shape[0])
@@ -685,6 +750,7 @@ def process_dataset(
     # --- Canonicalização + merge-ready --------------------------------
     feature_map = build_feature_map(expr_ready_f["Probe_ID"].tolist(), platform_id)
     expr_merge_ready = prepare_merge_ready(expr_ready_f, feature_map, kept_samples)
+    expr_merge_ready = impute_by_probe_median(expr_merge_ready)
     expr_merge_zscore = zscore_by_probe(expr_merge_ready)
 
     # --- Salvar --------------------------------------------------------
@@ -717,50 +783,65 @@ def process_dataset(
 # ========================================================================
 # 8. Merge cross-platform
 # ========================================================================
-def merge_datasets(
-    dataset_results: Sequence[Dict[str, object]],
+def _merge_matrices(
+    paths: Sequence[Path],
+    annot_paths: Sequence[Path],
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Combina matrizes z-scored dos datasets pela interseção de miRNAs.
-
-    Retorna (merged_expr_zscore, merged_annotation) – expressão em
-    miRNA × sample.
-    """
+    """Helper: carrega CSVs, mantém interseção de índices e concatena colunas."""
     expr_dfs: List[pd.DataFrame] = []
     annot_dfs: List[pd.DataFrame] = []
-    for res in dataset_results:
-        expr = pd.read_csv(res["expr_merge_ready_zscore"], index_col=0)
-        annot = pd.read_csv(res["sample_annotation"])
-        # Mantém apenas amostras presentes em ambos
+    for p, ap in zip(paths, annot_paths):
+        expr = pd.read_csv(p, index_col=0)
+        annot = pd.read_csv(ap)
         common = [c for c in expr.columns if c in set(annot["sample_id"])]
-        expr = expr[common]
-        annot = annot[annot["sample_id"].isin(common)]
-        expr_dfs.append(expr)
-        annot_dfs.append(annot)
+        expr_dfs.append(expr[common])
+        annot_dfs.append(annot[annot["sample_id"].isin(common)])
 
-    if not expr_dfs:
-        raise RuntimeError("Nenhuma matriz disponível para merge")
-
-    common_mirnas = set(expr_dfs[0].index)
+    common_idx = set(expr_dfs[0].index)
     for df in expr_dfs[1:]:
-        common_mirnas &= set(df.index)
-    common_mirnas = sorted(common_mirnas)
-    logger.info("[merge] %d miRNAs em comum entre %d datasets",
-                len(common_mirnas), len(expr_dfs))
-    if not common_mirnas:
+        common_idx &= set(df.index)
+    common_idx = sorted(common_idx)
+    if not common_idx:
         raise RuntimeError("Interseção de miRNAs vazia — revisar canonicalização")
 
-    aligned = [df.loc[common_mirnas] for df in expr_dfs]
+    aligned = [df.loc[common_idx] for df in expr_dfs]
     merged_expr = pd.concat(aligned, axis=1)
     merged_annot = pd.concat(annot_dfs, ignore_index=True)
-
-    # Segurança: garantir alinhamento de colunas × annotation
     merged_annot = merged_annot[merged_annot["sample_id"].isin(merged_expr.columns)]
     merged_annot = merged_annot.drop_duplicates("sample_id").reset_index(drop=True)
     merged_expr = merged_expr[list(merged_annot["sample_id"])]
-
-    logger.info("[merge] matriz final: %d miRNAs × %d amostras",
-                merged_expr.shape[0], merged_expr.shape[1])
     return merged_expr, merged_annot
+
+
+def merge_datasets(
+    dataset_results: Sequence[Dict[str, object]],
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Combina matrizes dos datasets pela interseção de miRNAs.
+
+    Retorna (merged_raw, merged_zscore, merged_annotation).
+    - merged_raw: concatenado de `expression_merge_ready.csv` (pré-z-score)
+    - merged_zscore: concatenado de `expression_merge_ready_zscore.csv`
+    - merged_annotation: anotação concatenada
+    """
+    if not dataset_results:
+        raise RuntimeError("Nenhum dataset para merge")
+
+    zscore_paths = [r["expr_merge_ready_zscore"] for r in dataset_results]
+    raw_paths = [r["expr_merge_ready"] for r in dataset_results]
+    annot_paths = [r["sample_annotation"] for r in dataset_results]
+
+    merged_z, merged_annot = _merge_matrices(zscore_paths, annot_paths)
+    merged_raw, _ = _merge_matrices(raw_paths, annot_paths)
+    # Restringe raw para mesmo conjunto de miRNAs e amostras do z-scored
+    merged_raw = merged_raw.loc[
+        [i for i in merged_raw.index if i in set(merged_z.index)],
+        list(merged_annot["sample_id"]),
+    ]
+    merged_raw = merged_raw.loc[list(merged_z.index)]
+
+    logger.info("[merge] matriz final: %d miRNAs × %d amostras (em %d datasets)",
+                merged_z.shape[0], merged_z.shape[1], len(dataset_results))
+    return merged_raw, merged_z, merged_annot
 
 
 # ========================================================================
@@ -787,6 +868,11 @@ def apply_combat(
     if batch.nunique() < 2:
         logger.warning("[combat] apenas 1 batch — nada a corrigir, retornando cópia")
         return X
+
+    # Safety net: ComBat/neuroCombat não lidam bem com NaN
+    if X.isna().any().any():
+        logger.warning("[combat] NaN detectado na entrada — imputando mediana do probe")
+        X = impute_by_probe_median(X)
 
     # --- 1) neuroCombat ------------------------------------------------
     try:
@@ -852,10 +938,29 @@ def calculate_purity(
     return total / N
 
 
-def _kmeans_labels(X_samples_by_features: np.ndarray, k: int) -> np.ndarray:
-    k = max(1, min(k, X_samples_by_features.shape[0]))
+def _reduce_for_clustering(X: np.ndarray, n_components: int = 10) -> np.ndarray:
+    """PCA para clusterização — evita que outliers em alta dimensão dominem
+    o KMeans. Usa no máximo min(n_components, n_samples-1, n_features)."""
+    n_comp = min(n_components, X.shape[0] - 1, X.shape[1])
+    if n_comp < 2:
+        return X
+    return PCA(n_components=n_comp, random_state=42).fit_transform(X)
+
+
+def _kmeans_labels(X: np.ndarray, k: int) -> np.ndarray:
+    k = max(1, min(k, X.shape[0]))
     km = KMeans(n_clusters=k, random_state=42, n_init=10)
-    return km.fit_predict(X_samples_by_features)
+    return km.fit_predict(X)
+
+
+def _purity_pair(X: np.ndarray, batches: np.ndarray, classes: np.ndarray) -> Tuple[float, float]:
+    """Calcula PurityB e PurityD em um mesmo embedding PCA-reduzido."""
+    X_red = _reduce_for_clustering(X, n_components=10)
+    nb = max(2, len(set(batches)))
+    nc = max(2, len(set(classes)))
+    pb = calculate_purity(_kmeans_labels(X_red, nb), batches)
+    pd_ = calculate_purity(_kmeans_labels(X_red, nc), classes)
+    return pb, pd_
 
 
 def purity_validation(
@@ -864,35 +969,46 @@ def purity_validation(
     sample_annot: pd.DataFrame,
     batch_col: str = "batch",
     class_col: str = "class_label",
+    expr_raw: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    """Calcula PurityB / PurityD antes e depois do ComBat."""
+    """Calcula PurityB / PurityD antes e depois do ComBat.
+
+    Clusterização é feita após redução por PCA(10) para mitigar ruído de
+    alta dimensionalidade. Se `expr_raw` for passado (merged pré-z-score),
+    também reporta um estágio de baseline.
+    """
     annot = sample_annot.set_index("sample_id")
     samples = [s for s in expr_before.columns if s in annot.index and s in expr_after.columns]
     batches = annot.loc[samples, batch_col].astype(str).to_numpy()
     classes = annot.loc[samples, class_col].astype(str).to_numpy()
 
-    # Preenche NaN (possíveis em z-score) com 0 para clusterização
-    X_before = expr_before[samples].fillna(0).to_numpy().T  # samples × features
+    rows: List[Dict[str, object]] = []
+
+    if expr_raw is not None:
+        raw_samples = [s for s in samples if s in expr_raw.columns]
+        if len(raw_samples) == len(samples):
+            X_raw = expr_raw[samples].fillna(0).to_numpy().T
+            pb, pdd = _purity_pair(X_raw, batches, classes)
+            rows.append({"stage": "merged_raw", "PurityB": pb, "PurityD": pdd})
+            logger.info("[purity] merged_raw           PurityB=%.3f  PurityD=%.3f",
+                        pb, pdd)
+
+    X_before = expr_before[samples].fillna(0).to_numpy().T
     X_after = expr_after[samples].fillna(0).to_numpy().T
+    pb_b, pd_b = _purity_pair(X_before, batches, classes)
+    pb_a, pd_a = _purity_pair(X_after, batches, classes)
+    rows.append({"stage": "before_combat", "PurityB": pb_b, "PurityD": pd_b})
+    rows.append({"stage": "after_combat",  "PurityB": pb_a, "PurityD": pd_a})
 
-    nb = max(2, len(set(batches)))
-    nc = max(2, len(set(classes)))
-
-    pb_before = calculate_purity(_kmeans_labels(X_before, nb), batches)
-    pb_after = calculate_purity(_kmeans_labels(X_after, nb), batches)
-    pd_before = calculate_purity(_kmeans_labels(X_before, nc), classes)
-    pd_after = calculate_purity(_kmeans_labels(X_after, nc), classes)
-
-    rows = [
-        {"stage": "before_combat", "PurityB": pb_before, "PurityD": pd_before},
-        {"stage": "after_combat",  "PurityB": pb_after,  "PurityD": pd_after},
-    ]
-    df = pd.DataFrame(rows)
-    logger.info("[purity] PurityB  before=%.3f  after=%.3f   (esperado: diminuir)",
-                pb_before, pb_after)
-    logger.info("[purity] PurityD  before=%.3f  after=%.3f   (esperado: manter/subir)",
-                pd_before, pd_after)
-    return df
+    logger.info("[purity] before_combat (zscore)   PurityB=%.3f  PurityD=%.3f",
+                pb_b, pd_b)
+    logger.info("[purity] after_combat            PurityB=%.3f  PurityD=%.3f",
+                pb_a, pd_a)
+    logger.info("[purity] ΔPurityB (after-before)=%+.3f   (esperado: ≤0)",
+                pb_a - pb_b)
+    logger.info("[purity] ΔPurityD (after-before)=%+.3f   (esperado: ≥0)",
+                pd_a - pd_b)
+    return pd.DataFrame(rows)
 
 
 # ========================================================================
@@ -1023,10 +1139,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     args.skip_merge, len(results))
         return 0
 
-    merged_expr, merged_annot = merge_datasets(results)
+    merged_raw, merged_expr, merged_annot = merge_datasets(results)
+    merged_raw.to_csv(output_root / "merged_expression_raw.csv")
     merged_expr.to_csv(output_root / "merged_expression_zscore.csv")
     merged_annot.to_csv(output_root / "merged_sample_annotation.csv", index=False)
-    logger.info("[merge] salvos merged_expression_zscore.csv / merged_sample_annotation.csv")
+    logger.info("[merge] salvos merged_expression_{raw,zscore}.csv / merged_sample_annotation.csv")
 
     # --- ComBat ------------------------------------------------------
     if args.no_combat:
@@ -1051,6 +1168,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         expr_before=merged_expr,
         expr_after=merged_combat,
         sample_annot=merged_annot,
+        expr_raw=merged_raw,
     )
     purity_df.to_csv(output_root / "purity_metrics.csv", index=False)
     logger.info("[purity] salvo purity_metrics.csv")
