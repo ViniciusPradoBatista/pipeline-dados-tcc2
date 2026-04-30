@@ -12,6 +12,7 @@
     - ComBat batch correction (preserving biological signal)
     - PurityB / PurityD validation
     - PCA and optional UMAP visualization
+    - Automatic inclusion of healthy controls
 
   Supported platforms:
     Affymetrix (GPL19117, GPL18402, etc.)
@@ -110,6 +111,21 @@ KNOWN_PLATFORMS: Dict[str, str] = {
     "GPL96":    "Affymetrix HG-U133A",
 }
 
+# Synonyms for auto-control inclusion
+HEALTHY_SYNONYMS_STRICT = [
+    "healthy control", "healthy controls", "healthy subject", "healthy subjects",
+    "healthy volunteer", "normal control", "normal controls", "normal", "unaffected"
+]
+
+HEALTHY_SYNONYMS_BROAD = [
+    "control", "controls", "non-cancer control", "non cancer control", "benign control"
+]
+
+PATHOLOGICAL_SYNONYMS = [
+    "cancer", "carcinoma", "adenocarcinoma", "tumor", "tumour", "neoplasm",
+    "malignant", "pdac", "pancreatic cancer", "cholangiocarcinoma", "disease", "diseases"
+]
+
 
 # =====================================================================
 # 1. CLI (argparse)
@@ -181,6 +197,24 @@ Examples:
         "--no-plots", action="store_true",
         help="Skip plot generation",
     )
+    # New flags for auto-control inclusion
+    parser.add_argument(
+        "--auto-add-healthy-control", action="store_true", default=True,
+        help="Automatically include healthy controls if a pathological condition is selected (default: True)",
+    )
+    parser.add_argument(
+        "--no-auto-add-healthy-control", action="store_false", dest="auto_add_healthy_control",
+        help="Disable automatic inclusion of healthy controls",
+    )
+    parser.add_argument(
+        "--strict-control-only", action="store_true", default=True,
+        help="Only accept explicitly healthy/normal labels as controls (default: True)",
+    )
+    parser.add_argument(
+        "--no-strict-control-only", action="store_false", dest="strict_control_only",
+        help="Accept broader synonyms like 'control' for automatic inclusion",
+    )
+    
     return parser.parse_args()
 
 
@@ -298,7 +332,7 @@ def interactive_output_picker() -> str:
                         print("  Nenhuma pasta selecionada. Usando pasta atual.")
                         return "."
                 except ImportError:
-                    print("  tkinter nao disponivel. Digite o caminho:")
+                    print("  tkinter nao disponivel. Digite the caminho:")
                     path = input("  Caminho: ").strip()
                     return path if path else "."
             elif choice == "3":
@@ -881,6 +915,9 @@ def select_conditions_cli(
             if raw == "0":
                 return None
 
+            if not raw:
+                continue
+
             indices = [int(x.strip()) for x in raw.split(",")]
             selected: List[str] = []
             for idx in indices:
@@ -890,16 +927,99 @@ def select_conditions_cli(
                     print(f"  ❌ Invalid number: {idx}")
 
             if selected:
+                # Deduplicate while preserving order
+                seen = set()
+                dedup = []
                 for s in selected:
+                    if s not in seen:
+                        dedup.append(s)
+                        seen.add(s)
+                
+                for s in dedup:
                     cnt = dict(grouped_conditions).get(s, 0)
                     print(f"  ✅ '{s}' ({cnt} amostras)")
-                return selected
+                return dedup
 
         except ValueError:
             print("  ❌ Enter numbers only.")
         except (EOFError, KeyboardInterrupt):
             print("\n  ⚠️ Using all samples (no filter).")
             return None
+
+
+def auto_include_healthy_controls(
+    selected_conditions: List[str],
+    grouped_conditions: List[Tuple[str, int]],
+    strict_control_only: bool = True
+) -> List[str]:
+    """
+    Automatically detect and include healthy control groups if a 
+    pathological condition was selected.
+    
+    Args:
+        selected_conditions: Conditions selected by the user.
+        grouped_conditions: All conditions available in the dataset.
+        strict_control_only: If True, only accept explicit 'healthy/normal' labels.
+        
+    Returns:
+        Updated list of conditions including auto-detected controls.
+    """
+    final_selection = list(selected_conditions)
+    all_available = [c[0] for c in grouped_conditions]
+    
+    # 1. Check if any selected condition is pathological
+    is_pathological = False
+    for sel in selected_conditions:
+        sel_lower = sel.lower()
+        if any(term in sel_lower for term in PATHOLOGICAL_SYNONYMS):
+            is_pathological = True
+            break
+            
+    if not is_pathological:
+        return final_selection
+
+    # 2. Check if a control is already selected
+    control_already_selected = False
+    all_healthy_terms = HEALTHY_SYNONYMS_STRICT + ([] if strict_control_only else HEALTHY_SYNONYMS_BROAD)
+    
+    for sel in selected_conditions:
+        sel_lower = sel.lower()
+        if any(term == sel_lower for term in all_healthy_terms):
+            control_already_selected = True
+            break
+        # substring match as fallback
+        if any(term in sel_lower for term in all_healthy_terms):
+            control_already_selected = True
+            break
+            
+    if control_already_selected:
+        return final_selection
+
+    # 3. Find the best healthy control in the dataset
+    found_control = None
+    search_list = HEALTHY_SYNONYMS_STRICT if strict_control_only else (HEALTHY_SYNONYMS_STRICT + HEALTHY_SYNONYMS_BROAD)
+    
+    # Priority search: find exact matches or best-fit synonyms in order of priority list
+    for term in search_list:
+        for available in all_available:
+            if term == available.lower():
+                found_control = available
+                break
+            # substring match if exact fails
+            if term in available.lower():
+                found_control = available
+                break
+        if found_control:
+            break
+            
+    if found_control:
+        log.info(f"Auto-added healthy control: ['{found_control}']")
+        if found_control not in final_selection:
+            final_selection.append(found_control)
+    else:
+        log.info("No healthy control group found for automatic inclusion.")
+        
+    return final_selection
 
 
 def filter_samples_by_conditions(
@@ -957,11 +1077,6 @@ def canonicalize_probe_id(probe_id: str, platform_id: str) -> Tuple[str, bool]:
 
     Returns:
         (canonical_id, is_ambiguous)
-
-    Rules:
-        Affymetrix: remove trailing '_st'
-        3D-Gene:    split comma-separated MIMATs; flag if >1
-        Other:      pass through, strip whitespace
     """
     pid = probe_id.strip()
 
@@ -1013,8 +1128,6 @@ def build_feature_map(
 # 10. Sample Annotation
 # =====================================================================
 
-
-
 def build_sample_annotation(
     meta_df: pd.DataFrame,
     gsm_cols: List[str],
@@ -1030,7 +1143,7 @@ def build_sample_annotation(
         sample_id, dataset_id, batch, platform_id, platform_name,
         condition_raw, condition_normalized, class_label
     """
-    # Find the GSM accession column (prioritise Sample_ over Series_)
+    # Find the GSM accession column
     gsm_col: Optional[str] = None
     for col in meta_df.columns:
         if "sample_geo_accession" in col.lower().replace(" ", "_"):
@@ -1039,7 +1152,6 @@ def build_sample_annotation(
     if gsm_col is None:
         for col in meta_df.columns:
             if "geo_accession" in col.lower():
-                # Verify it actually contains GSM IDs, not GSE IDs
                 if meta_df[col].astype(str).str.match(r"^GSM\d+").any():
                     gsm_col = col
                     break
@@ -1051,6 +1163,16 @@ def build_sample_annotation(
 
     all_columns = list(meta_df.columns)
     records: List[dict] = []
+
+    # Prepare effective mapping with defaults
+    effective_map = {
+        "pancreatic cancer": "PDAC",
+        "pdac": "PDAC",
+        "healthy control": "Control",
+        "normal": "Control"
+    }
+    if class_map:
+        effective_map.update(class_map)
 
     for gsm_id in gsm_cols:
         condition_raw = ""
@@ -1064,11 +1186,20 @@ def build_sample_annotation(
 
         # Map to class label
         class_label = condition_normalized
-        if class_map:
-            for pattern, label in class_map.items():
-                if pattern.lower() in condition_normalized.lower():
-                    class_label = label
-                    break
+        
+        # Check against map
+        matched = False
+        for pattern, label in effective_map.items():
+            if pattern.lower() in condition_normalized.lower():
+                class_label = label
+                matched = True
+                break
+        
+        # Specific fallback for healthy controls using synonyms if not matched
+        if not matched:
+            all_healthy = HEALTHY_SYNONYMS_STRICT + HEALTHY_SYNONYMS_BROAD
+            if any(term in condition_normalized.lower() for term in all_healthy):
+                class_label = "Control"
 
         records.append({
             "sample_id": gsm_id,
@@ -1094,10 +1225,6 @@ def build_sample_annotation(
 def zscore_by_probe(expr_df: pd.DataFrame) -> pd.DataFrame:
     """
     Z-score normalize each probe (row) across samples within a dataset.
-
-        z = (x − mean_probe) / std_probe
-
-    Probes with zero variance get z = 0.
     """
     result = expr_df.copy()
     gsm_cols = [c for c in result.columns if c.startswith("GSM")]
@@ -1108,7 +1235,7 @@ def zscore_by_probe(expr_df: pd.DataFrame) -> pd.DataFrame:
         warnings.simplefilter("ignore")
         means = np.nanmean(data, axis=1, keepdims=True)
         stds = np.nanstd(data, axis=1, keepdims=True, ddof=0)
-        stds[stds == 0] = 1.0  # avoid division by zero
+        stds[stds == 0] = 1.0
         z_data = (data - means) / stds
 
     result[gsm_cols] = z_data
@@ -1132,24 +1259,12 @@ def process_single_dataset(
     no_interactive: bool = False,
     condition_filter: Optional[List[str]] = None,
     class_map: Optional[Dict[str, str]] = None,
+    auto_add_healthy_control: bool = True,
+    strict_control_only: bool = True,
 ) -> Optional[Path]:
     """
     Run the full per-dataset processing pipeline on a single
     GEO Series Matrix file.
-
-    Outputs (in out_<GSE_ID>/):
-        expression_text_preservado.csv
-        expression_numerico.csv
-        expression_analysis_ready.csv
-        feature_map.csv
-        expression_merge_ready.csv
-        expression_merge_ready_zscore.csv
-        sample_annotation.csv
-        metadata_full.csv
-        metadata_<filter>.csv
-
-    Returns:
-        Path to the output directory, or None on failure.
     """
     dataset_id = extract_dataset_id(path)
     out_dir = output_root / f"out_{dataset_id}"
@@ -1177,6 +1292,17 @@ def process_single_dataset(
     selected = select_conditions_cli(
         conditions, condition_filter, no_interactive,
     )
+    
+    # Apply automatic healthy control inclusion
+    if selected is not None and auto_add_healthy_control:
+        log.info(f"Selected by user: {selected}")
+        final_conditions = auto_include_healthy_controls(
+            selected, conditions, strict_control_only
+        )
+        if final_conditions != selected:
+            log.info(f"Final conditions used for filtering: {final_conditions}")
+        selected = final_conditions
+
     meta_filtered = filter_samples_by_conditions(
         meta_df, selected, condition_cols,
     )
@@ -1189,7 +1315,7 @@ def process_single_dataset(
             for c in selected
         )
         meta_filtered.to_csv(
-            out_dir / f"metadata_{label}.csv", index=False,
+            out_dir / f"metadata_{label[:50]}.csv", index=False,
         )
 
     # ── STEP 3: Expression reading ───────────────────────────────
@@ -1238,7 +1364,6 @@ def process_single_dataset(
     log.info("── Step 6: Probe ID harmonization ──")
     feature_map = build_feature_map(expr_num_filt, platform_id)
 
-    # Merge ready: canonical IDs, exclude ambiguous probes
     fmap_clean = feature_map[~feature_map["Probe_ID_Ambiguous"]].copy()
 
     expr_merge = expr_ready.merge(
@@ -1251,7 +1376,6 @@ def process_single_dataset(
         columns={"Probe_ID_Canonical": "Probe_ID"}, inplace=True,
     )
 
-    # Average duplicate canonical IDs
     if expr_merge["Probe_ID"].duplicated().any():
         n_dup = expr_merge["Probe_ID"].duplicated().sum()
         log.info(f"Averaging {n_dup} duplicate canonical Probe IDs")
@@ -1261,7 +1385,6 @@ def process_single_dataset(
             .mean()
         )
 
-    # Reorder columns
     expr_merge = expr_merge[["Probe_ID"] + keep_cols]
 
     # ── STEP 7: Z-score ──────────────────────────────────────────
@@ -1285,11 +1408,6 @@ def process_single_dataset(
     expr_zscore.to_csv(out_dir / "expression_merge_ready_zscore.csv", index=False)
     sample_annot.to_csv(out_dir / "sample_annotation.csv", index=False)
 
-    log.info(f"✅ Dataset {dataset_id} — all outputs saved:")
-    for fpath in sorted(out_dir.glob("*.csv")):
-        size_kb = fpath.stat().st_size / 1024
-        log.info(f"   • {fpath.name} ({size_kb:.1f} KB)")
-
     return out_dir
 
 
@@ -1301,25 +1419,7 @@ def merge_datasets(
     dataset_dirs: List[Path],
     output_dir: Path,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Merge multiple datasets by shared (intersected) miRNA IDs.
-
-    Reads BOTH expression_merge_ready.csv (raw log2) and
-    expression_merge_ready_zscore.csv from each dataset directory,
-    plus sample_annotation.csv.
-
-    ComBat needs the RAW (non-z-scored) merged data to detect
-    batch-mean differences. Z-scored data is also produced for
-    reference but should NOT be used as ComBat input.
-
-    Outputs:
-        merged_expression_raw.csv       ← for ComBat input
-        merged_expression_zscore.csv    ← for reference / fallback
-        merged_sample_annotation.csv
-
-    Returns:
-        (merged_raw, merged_zscore, merged_annot)
-    """
+    """Merge multiple datasets by shared miRNA IDs."""
     log.info("")
     log.info("=" * 60)
     log.info("  MERGE: Combining datasets")
@@ -1335,14 +1435,7 @@ def merge_datasets(
         zscore_path = d / "expression_merge_ready_zscore.csv"
         annot_path = d / "sample_annotation.csv"
 
-        if not raw_path.exists():
-            log.warning(f"Missing {raw_path}; skipping {d.name}")
-            continue
-        if not zscore_path.exists():
-            log.warning(f"Missing {zscore_path}; skipping {d.name}")
-            continue
-        if not annot_path.exists():
-            log.warning(f"Missing {annot_path}; skipping {d.name}")
+        if not raw_path.exists() or not zscore_path.exists() or not annot_path.exists():
             continue
 
         raw = pd.read_csv(raw_path)
@@ -1355,32 +1448,18 @@ def merge_datasets(
         all_zscore.append(zscore)
         all_annot.append(annot)
 
-        log.info(
-            f"  {d.name}: {raw.shape[0]} miRNAs, "
-            f"{raw.shape[1] - 1} samples"
-        )
-
     if len(all_raw) < 2:
-        log.warning("Need >= 2 datasets to merge")
         if all_raw:
             return all_raw[0], all_zscore[0], all_annot[0]
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    # Intersect miRNA IDs
     common: set = all_mirna_sets[0]
     for s in all_mirna_sets[1:]:
         common = common.intersection(s)
 
-    log.info(f"Common miRNAs across all datasets: {len(common)}")
-
     if not common:
-        log.error(
-            "No common miRNAs found! "
-            "Verify probe ID harmonization."
-        )
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    # Subset each to common miRNAs and concatenate columns
     def _merge_list(dfs: List[pd.DataFrame]) -> pd.DataFrame:
         parts = []
         for df in dfs:
@@ -1393,30 +1472,12 @@ def merge_datasets(
     merged_zscore = _merge_list(all_zscore)
     merged_annot = pd.concat(all_annot, ignore_index=True)
 
-    # Save
     output_dir.mkdir(parents=True, exist_ok=True)
-    merged_raw.to_csv(
-        output_dir / "merged_expression_raw.csv", index=False,
-    )
-    merged_zscore.to_csv(
-        output_dir / "merged_expression_zscore.csv", index=False,
-    )
-    merged_annot.to_csv(
-        output_dir / "merged_sample_annotation.csv", index=False,
-    )
+    merged_raw.to_csv(output_dir / "merged_expression_raw.csv", index=False)
+    merged_zscore.to_csv(output_dir / "merged_expression_zscore.csv", index=False)
+    merged_annot.to_csv(output_dir / "merged_sample_annotation.csv", index=False)
 
-    log.info(
-        f"Merged: {merged_raw.shape[0]} miRNAs x "
-        f"{merged_raw.shape[1] - 1} samples"
-    )
-    log.info(
-        f"Samples by dataset: "
-        f"{merged_annot['dataset_id'].value_counts().to_dict()}"
-    )
-    log.info(
-        f"Samples by class: "
-        f"{merged_annot['class_label'].value_counts().to_dict()}"
-    )
+    log.info(f"Samples by class after filtering: {merged_annot['class_label'].value_counts().to_dict()}")
 
     return merged_raw, merged_zscore, merged_annot
 
@@ -1436,10 +1497,8 @@ def _try_install_neurocombat() -> bool:
         if result.returncode == 0:
             log.info("✅ neuroCombat installed successfully")
             return True
-        log.warning(f"pip install failed:\n{result.stderr[:500]}")
         return False
-    except Exception as exc:
-        log.warning(f"Install failed: {exc}")
+    except Exception:
         return False
 
 
@@ -1449,189 +1508,65 @@ def apply_combat(
     batch_col: str = "batch",
     class_col: str = "class_label",
 ) -> Optional[pd.DataFrame]:
-    """
-    Apply ComBat batch correction preserving biological signal.
-
-    The class_label column is used as a biological covariate so that
-    disease-related variation is NOT removed.
-
-    Tries libraries in order:
-        1. neuroCombat  (auto-installs if missing)
-        2. inmoose.pycombat.pycombat_norm
-        3. Returns None with instructions
-
-    Args:
-        expr_df:      Probe_ID + GSM columns (features × samples)
-        sample_annot: sample_id, batch, class_label, …
-        batch_col:    column name for batch (dataset/platform)
-        class_col:    column name for biological class
-
-    Returns:
-        Corrected DataFrame (same shape as input), or None.
-    """
+    """Apply ComBat batch correction."""
     gsm_cols = [c for c in expr_df.columns if c.startswith("GSM")]
-
-    # Align samples between expression and annotation
     annot_ids = set(sample_annot["sample_id"])
     common_samples = [s for s in gsm_cols if s in annot_ids]
 
-    if len(common_samples) < len(gsm_cols):
-        log.warning(
-            f"Annotation has {len(common_samples)}/{len(gsm_cols)} "
-            f"matching samples"
-        )
+    annot_aligned = sample_annot.set_index("sample_id").loc[common_samples].reset_index()
+    expr_matrix = expr_df.set_index("Probe_ID")[common_samples].values.astype(float)
 
-    annot_aligned = (
-        sample_annot
-        .set_index("sample_id")
-        .loc[common_samples]
-        .reset_index()
-    )
-
-    # Expression matrix: features × samples (numpy)
-    expr_matrix = (
-        expr_df
-        .set_index("Probe_ID")[common_samples]
-        .values
-        .astype(float)
-    )
-
-    # Remove rows that are entirely NaN
     valid_mask = ~np.all(np.isnan(expr_matrix), axis=1)
     expr_clean = expr_matrix[valid_mask].copy()
     probe_ids = expr_df["Probe_ID"].values[valid_mask]
 
-    # Impute remaining NaNs with row mean
     for i in range(expr_clean.shape[0]):
         row = expr_clean[i]
-        nans = np.isnan(row)
-        if nans.any():
-            row[nans] = np.nanmean(row)
+        if np.isnan(row).any():
+            row[np.isnan(row)] = np.nanmean(row)
             expr_clean[i] = row
 
-    # Covariates DataFrame
     covars = pd.DataFrame({
         batch_col: annot_aligned[batch_col].values,
         class_col: annot_aligned[class_col].values,
     })
 
-    log.info(
-        f"ComBat input: {expr_clean.shape[0]} features × "
-        f"{expr_clean.shape[1]} samples"
-    )
-    log.info(f"  Batches: {covars[batch_col].value_counts().to_dict()}")
-    log.info(f"  Classes: {covars[class_col].value_counts().to_dict()}")
-
     corrected = None
-
-    # ── Try 1: neuroCombat ──
     try:
         from neuroCombat import neuroCombat
-
-        log.info("Using neuroCombat for batch correction")
-        result = neuroCombat(
-            dat=expr_clean,
-            covars=covars,
-            batch_col=batch_col,
-            categorical_cols=[class_col],
-        )
+        result = neuroCombat(dat=expr_clean, covars=covars, batch_col=batch_col, categorical_cols=[class_col])
         corrected = result["data"]
-        log.info("✅ neuroCombat completed successfully")
-
     except ImportError:
-        log.info("neuroCombat not found — attempting auto-install...")
         if _try_install_neurocombat():
-            try:
-                from neuroCombat import neuroCombat
+            from neuroCombat import neuroCombat
+            result = neuroCombat(dat=expr_clean, covars=covars, batch_col=batch_col, categorical_cols=[class_col])
+            corrected = result["data"]
 
-                result = neuroCombat(
-                    dat=expr_clean,
-                    covars=covars,
-                    batch_col=batch_col,
-                    categorical_cols=[class_col],
-                )
-                corrected = result["data"]
-                log.info("✅ neuroCombat completed (after install)")
-            except Exception as exc:
-                log.error(f"neuroCombat failed after install: {exc}")
-        else:
-            log.info("neuroCombat auto-install failed; trying inmoose…")
-
-    except Exception as exc:
-        log.error(f"neuroCombat error: {exc}")
-
-    # ── Try 2: inmoose ──
     if corrected is None:
         try:
             from inmoose.pycombat import pycombat_norm
-
-            log.info("Using inmoose pycombat_norm for batch correction")
-
-            # Build design matrix for biological covariate
-            covar_mod = pd.get_dummies(
-                covars[[class_col]], drop_first=True,
-            ).astype(float)
-
-            expr_df_in = pd.DataFrame(
-                expr_clean, index=probe_ids, columns=common_samples,
-            )
-
-            corrected_df = pycombat_norm(
-                counts=expr_df_in,
-                batch=covars[batch_col].values,
-                covar_mod=covar_mod,
-            )
+            covar_mod = pd.get_dummies(covars[[class_col]], drop_first=True).astype(float)
+            expr_df_in = pd.DataFrame(expr_clean, index=probe_ids, columns=common_samples)
+            corrected_df = pycombat_norm(counts=expr_df_in, batch=covars[batch_col].values, covar_mod=covar_mod)
             corrected = corrected_df.values
-            log.info("✅ inmoose pycombat_norm completed successfully")
-
-        except ImportError:
-            log.error(
-                "❌ No ComBat library available!\n"
-                "   Install one of:\n"
-                "     pip install neuroCombat\n"
-                "     pip install inmoose\n"
-            )
-            return None
-        except Exception as exc:
-            log.error(f"inmoose error: {exc}")
+        except Exception:
             return None
 
-    # ── Rebuild DataFrame ──
     out_df = pd.DataFrame(corrected, columns=common_samples)
     out_df.insert(0, "Probe_ID", probe_ids)
-
-    log.info(
-        f"ComBat output: {out_df.shape[0]} features × "
-        f"{out_df.shape[1] - 1} samples"
-    )
     return out_df
 
 
 # =====================================================================
-# 15. Purity Metrics (PurityB & PurityD)
+# 15. Purity Metrics
 # =====================================================================
 
-def calculate_purity(
-    cluster_labels: np.ndarray,
-    true_labels: np.ndarray,
-) -> float:
-    """
-    Calculate cluster purity.
-
-        Purity = (1/N) * Σ_k  max_j  |w_k ∩ c_j|
-
-    where:
-        N   = total number of samples
-        w_k = set of samples assigned to cluster k
-        c_j = set of samples belonging to true class j
-    """
+def calculate_purity(cluster_labels: np.ndarray, true_labels: np.ndarray) -> float:
+    """Calculate cluster purity."""
     n = len(cluster_labels)
-    if n == 0:
-        return 0.0
-
+    if n == 0: return 0.0
     cluster_ids = np.unique(cluster_labels)
     true_ids = np.unique(true_labels)
-
     total = 0
     for k in cluster_ids:
         cluster_mask = cluster_labels == k
@@ -1639,10 +1574,8 @@ def calculate_purity(
         for j in true_ids:
             class_mask = true_labels == j
             overlap = int(np.sum(cluster_mask & class_mask))
-            if overlap > max_overlap:
-                max_overlap = overlap
+            if overlap > max_overlap: max_overlap = overlap
         total += max_overlap
-
     return total / n
 
 
@@ -1653,102 +1586,24 @@ def compute_purity_metrics(
     batch_col: str = "batch",
     class_col: str = "class_label",
 ) -> pd.DataFrame:
-    """
-    Compute PurityB and PurityD before and after ComBat.
-
-    PurityB: K-Means with k = n_batches, true labels = batch
-             → should DECREASE after ComBat (batches become mixed)
-    PurityD: K-Means with k = n_classes, true labels = class_label
-             → should STAY HIGH or INCREASE after ComBat
-
-    Returns:
-        DataFrame with one row: PurityB_before, PurityB_after,
-        PurityD_before, PurityD_after
-    """
-    gsm_cols_before = [
-        c for c in expr_before.columns if c.startswith("GSM")
-    ]
-    common = [
-        s for s in gsm_cols_before
-        if s in sample_annot["sample_id"].values
-    ]
+    """Compute PurityB and PurityD."""
+    gsm_cols = [c for c in expr_before.columns if c.startswith("GSM")]
+    common = [s for s in gsm_cols if s in sample_annot["sample_id"].values]
     annot = sample_annot.set_index("sample_id").loc[common]
 
-    batches = annot[batch_col].values
-    classes = annot[class_col].values
+    batch_enc = LabelEncoder().fit_transform(annot[batch_col].values)
+    class_enc = LabelEncoder().fit_transform(annot[class_col].values)
+    n_batches, n_classes = len(np.unique(batch_enc)), len(np.unique(class_enc))
 
-    n_batches = len(np.unique(batches))
-    n_classes = len(np.unique(classes))
+    results = {}
+    X_before = np.nan_to_num(expr_before.set_index("Probe_ID")[common].values.T, nan=0.0)
+    results["PurityB_before"] = calculate_purity(KMeans(n_clusters=n_batches, random_state=42, n_init=10).fit_predict(X_before), batch_enc)
+    results["PurityD_before"] = calculate_purity(KMeans(n_clusters=n_classes, random_state=42, n_init=10).fit_predict(X_before), class_enc)
 
-    le_batch = LabelEncoder()
-    batch_enc = le_batch.fit_transform(batches)
-    le_class = LabelEncoder()
-    class_enc = le_class.fit_transform(classes)
-
-    results: Dict[str, float] = {}
-
-    # ── Before ComBat ──
-    X_before = (
-        expr_before.set_index("Probe_ID")[common].values.T
-    )  # samples × features
-    X_before = np.nan_to_num(X_before, nan=0.0)
-
-    km_b = KMeans(n_clusters=n_batches, random_state=42, n_init=10)
-    results["PurityB_before"] = calculate_purity(
-        km_b.fit_predict(X_before), batch_enc,
-    )
-
-    km_d = KMeans(n_clusters=n_classes, random_state=42, n_init=10)
-    results["PurityD_before"] = calculate_purity(
-        km_d.fit_predict(X_before), class_enc,
-    )
-
-    # ── After ComBat ──
     if expr_after is not None:
-        gsm_after = [
-            c for c in expr_after.columns if c.startswith("GSM")
-        ]
-        common_after = [s for s in gsm_after if s in common]
-
-        X_after = (
-            expr_after.set_index("Probe_ID")[common_after].values.T
-        )
-        X_after = np.nan_to_num(X_after, nan=0.0)
-
-        annot_after = sample_annot.set_index("sample_id").loc[common_after]
-        batch_after = le_batch.transform(annot_after[batch_col].values)
-        class_after = le_class.transform(annot_after[class_col].values)
-
-        km_b2 = KMeans(n_clusters=n_batches, random_state=42, n_init=10)
-        results["PurityB_after"] = calculate_purity(
-            km_b2.fit_predict(X_after), batch_after,
-        )
-
-        km_d2 = KMeans(n_clusters=n_classes, random_state=42, n_init=10)
-        results["PurityD_after"] = calculate_purity(
-            km_d2.fit_predict(X_after), class_after,
-        )
-    else:
-        results["PurityB_after"] = np.nan
-        results["PurityD_after"] = np.nan
-
-    # Print summary
-    log.info("")
-    log.info("=" * 55)
-    log.info("  PURITY METRICS")
-    log.info("=" * 55)
-    for key, val in results.items():
-        log.info(f"  {key:<20s}: {val:.4f}")
-    log.info("-" * 55)
-    log.info(
-        "  ✓ PurityB should DECREASE after ComBat "
-        "(batch effect removed)"
-    )
-    log.info(
-        "  ✓ PurityD should STAY HIGH or INCREASE "
-        "(biological signal preserved)"
-    )
-    log.info("=" * 55)
+        X_after = np.nan_to_num(expr_after.set_index("Probe_ID")[common].values.T, nan=0.0)
+        results["PurityB_after"] = calculate_purity(KMeans(n_clusters=n_batches, random_state=42, n_init=10).fit_predict(X_after), batch_enc)
+        results["PurityD_after"] = calculate_purity(KMeans(n_clusters=n_classes, random_state=42, n_init=10).fit_predict(X_after), class_enc)
 
     return pd.DataFrame([results])
 
@@ -1757,186 +1612,31 @@ def compute_purity_metrics(
 # 16. Visualization
 # =====================================================================
 
-def _pca_scatter(
-    expr_df: pd.DataFrame,
-    sample_annot: pd.DataFrame,
-    color_col: str,
-    title: str,
-    save_path: Path,
-) -> None:
-    """Generate and save a PCA scatter plot."""
+def _pca_scatter(expr_df: pd.DataFrame, sample_annot: pd.DataFrame, color_col: str, title: str, save_path: Path) -> None:
     gsm_cols = [c for c in expr_df.columns if c.startswith("GSM")]
-    common = [
-        s for s in gsm_cols
-        if s in sample_annot["sample_id"].values
-    ]
-
-    X = expr_df.set_index("Probe_ID")[common].values.T  # samples × features
-    X = np.nan_to_num(X, nan=0.0)
-
-    pca = PCA(n_components=2, random_state=42)
-    pc = pca.fit_transform(X)
-
-    annot = sample_annot.set_index("sample_id").loc[common]
-    labels = annot[color_col].values
+    common = [s for s in gsm_cols if s in sample_annot["sample_id"].values]
+    X = np.nan_to_num(expr_df.set_index("Probe_ID")[common].values.T, nan=0.0)
+    pc = PCA(n_components=2, random_state=42).fit_transform(X)
+    labels = sample_annot.set_index("sample_id").loc[common][color_col].values
     unique_labels = sorted(set(labels))
-
     fig, ax = plt.subplots(figsize=(10, 8))
-
-    if HAS_SEABORN:
-        palette = sns.color_palette("husl", len(unique_labels))
-    else:
-        cmap = plt.cm.get_cmap("tab10", max(len(unique_labels), 1))
-        palette = [cmap(i) for i in range(len(unique_labels))]
-
+    palette = sns.color_palette("husl", len(unique_labels)) if HAS_SEABORN else [plt.cm.tab10(i) for i in range(len(unique_labels))]
     for i, label in enumerate(unique_labels):
         mask = labels == label
-        ax.scatter(
-            pc[mask, 0], pc[mask, 1],
-            label=label,
-            alpha=0.7,
-            s=50,
-            color=palette[i % len(palette)],
-            edgecolors="white",
-            linewidth=0.5,
-        )
-
-    ev = pca.explained_variance_ratio_
-    ax.set_xlabel(f"PC1 ({ev[0] * 100:.1f}%)")
-    ax.set_ylabel(f"PC2 ({ev[1] * 100:.1f}%)")
-    ax.set_title(title, fontsize=13)
-    ax.legend(
-        bbox_to_anchor=(1.05, 1), loc="upper left",
-        fontsize=9, framealpha=0.9,
-    )
-
+        ax.scatter(pc[mask, 0], pc[mask, 1], label=label, alpha=0.7, s=50, color=palette[i % len(palette)])
+    ax.set_title(title)
+    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
     fig.tight_layout()
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    log.info(f"🖼️  Plot saved: {save_path.name}")
 
 
-def _umap_scatter(
-    expr_df: pd.DataFrame,
-    sample_annot: pd.DataFrame,
-    color_col: str,
-    title: str,
-    save_path: Path,
-) -> None:
-    """Generate and save a UMAP scatter plot (requires umap-learn)."""
-    if not HAS_UMAP:
-        return
-
-    gsm_cols = [c for c in expr_df.columns if c.startswith("GSM")]
-    common = [
-        s for s in gsm_cols
-        if s in sample_annot["sample_id"].values
-    ]
-
-    X = expr_df.set_index("Probe_ID")[common].values.T
-    X = np.nan_to_num(X, nan=0.0)
-
-    reducer = umap_lib.UMAP(n_components=2, random_state=42)
-    embedding = reducer.fit_transform(X)
-
-    annot = sample_annot.set_index("sample_id").loc[common]
-    labels = annot[color_col].values
-    unique_labels = sorted(set(labels))
-
-    fig, ax = plt.subplots(figsize=(10, 8))
-
-    if HAS_SEABORN:
-        palette = sns.color_palette("husl", len(unique_labels))
-    else:
-        cmap = plt.cm.get_cmap("tab10", max(len(unique_labels), 1))
-        palette = [cmap(i) for i in range(len(unique_labels))]
-
-    for i, label in enumerate(unique_labels):
-        mask = labels == label
-        ax.scatter(
-            embedding[mask, 0], embedding[mask, 1],
-            label=label,
-            alpha=0.7,
-            s=50,
-            color=palette[i % len(palette)],
-            edgecolors="white",
-            linewidth=0.5,
-        )
-
-    ax.set_xlabel("UMAP 1")
-    ax.set_ylabel("UMAP 2")
-    ax.set_title(title, fontsize=13)
-    ax.legend(
-        bbox_to_anchor=(1.05, 1), loc="upper left",
-        fontsize=9, framealpha=0.9,
-    )
-
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    log.info(f"🖼️  UMAP saved: {save_path.name}")
-
-
-def generate_all_plots(
-    expr_before: pd.DataFrame,
-    expr_after: Optional[pd.DataFrame],
-    sample_annot: pd.DataFrame,
-    output_dir: Path,
-) -> None:
-    """Generate PCA (and optional UMAP) plots before/after ComBat."""
-    log.info("── Generating visualizations ──")
-
-    # Before ComBat
-    _pca_scatter(
-        expr_before, sample_annot, "batch",
-        "PCA — Before ComBat (colored by Batch/Platform)",
-        output_dir / "pca_before_batch.png",
-    )
-    _pca_scatter(
-        expr_before, sample_annot, "class_label",
-        "PCA — Before ComBat (colored by Class)",
-        output_dir / "pca_before_class.png",
-    )
-
-    # After ComBat
+def generate_all_plots(expr_before: pd.DataFrame, expr_after: Optional[pd.DataFrame], sample_annot: pd.DataFrame, output_dir: Path) -> None:
+    _pca_scatter(expr_before, sample_annot, "batch", "PCA - Before ComBat (Batch)", output_dir / "pca_before_batch.png")
+    _pca_scatter(expr_before, sample_annot, "class_label", "PCA - Before ComBat (Class)", output_dir / "pca_before_class.png")
     if expr_after is not None:
-        _pca_scatter(
-            expr_after, sample_annot, "batch",
-            "PCA — After ComBat (colored by Batch/Platform)",
-            output_dir / "pca_after_batch.png",
-        )
-        _pca_scatter(
-            expr_after, sample_annot, "class_label",
-            "PCA — After ComBat (colored by Class)",
-            output_dir / "pca_after_class.png",
-        )
-
-    # Optional UMAP
-    if HAS_UMAP:
-        log.info("UMAP available — generating UMAP plots")
-        _umap_scatter(
-            expr_before, sample_annot, "batch",
-            "UMAP — Before ComBat (Batch)",
-            output_dir / "umap_before_batch.png",
-        )
-        _umap_scatter(
-            expr_before, sample_annot, "class_label",
-            "UMAP — Before ComBat (Class)",
-            output_dir / "umap_before_class.png",
-        )
-        if expr_after is not None:
-            _umap_scatter(
-                expr_after, sample_annot, "batch",
-                "UMAP — After ComBat (Batch)",
-                output_dir / "umap_after_batch.png",
-            )
-            _umap_scatter(
-                expr_after, sample_annot, "class_label",
-                "UMAP — After ComBat (Class)",
-                output_dir / "umap_after_class.png",
-            )
-    else:
-        log.info("UMAP not available (install umap-learn for UMAP plots)")
+        _pca_scatter(expr_after, sample_annot, "batch", "PCA - After ComBat (Batch)", output_dir / "pca_after_batch.png")
+        _pca_scatter(expr_after, sample_annot, "class_label", "PCA - After ComBat (Class)", output_dir / "pca_after_class.png")
 
 
 # =====================================================================
@@ -1944,206 +1644,43 @@ def generate_all_plots(
 # =====================================================================
 
 def main() -> None:
-    """Main pipeline entry point."""
     args = build_cli()
-
-    print()
-    print("=" * 60)
-    print("  GEO miRNA Cross-Platform Integration Pipeline")
-    print("  For PDAC (Pancreatic Cancer) Research")
-    print("=" * 60)
-
-    # ── Interactive mode: if no files provided, open file picker ──
-    if not args.files:
-        print()
-        print("  Nenhum arquivo informado via linha de comando.")
-        print("  Vamos selecionar os arquivos de forma interativa!")
-        print()
-        print("-" * 50)
-        print("  Como deseja selecionar os arquivos?")
-        print("-" * 50)
-        print("  [1] Abrir seletor de arquivos (explorador)")
-        print("  [2] Digitar os caminhos manualmente")
-        print("-" * 50)
-
-        file_choice = ""
-        while file_choice not in ("1", "2"):
-            try:
-                file_choice = input(
-                    "\n  Escolha (1/2) [padrao: 1]: "
-                ).strip() or "1"
-            except (EOFError, KeyboardInterrupt):
-                print("\n  Cancelado pelo usuario.")
-                sys.exit(0)
-
-        if file_choice == "1":
-            selected_files = interactive_file_picker()
-        else:
-            print("\n  Digite os caminhos dos arquivos (um por linha).")
-            print("  Quando terminar, digite uma linha vazia e pressione Enter.")
-            selected_files = []
-            while True:
-                try:
-                    line = input("  Arquivo: ").strip().strip('"')
-                    if not line:
-                        break
-                    selected_files.append(line)
-                except (EOFError, KeyboardInterrupt):
-                    break
-
-        if not selected_files:
-            print("\n  Nenhum arquivo selecionado. Encerrando.")
-            sys.exit(0)
-
-        args.files = selected_files
-
-        # Show selected files
-        print("\n" + "-" * 50)
-        print(f"  {len(args.files)} arquivo(s) selecionado(s):")
-        print("-" * 50)
-        for i, f in enumerate(args.files, 1):
-            print(f"  {i}. {f}")
-
-        # Ask for output directory
-        out_choice = interactive_output_picker()
-        args.output_root = out_choice
-
-        print("\n" + "=" * 60)
-        print("  Configuracao:")
-        print(f"  Arquivos:    {len(args.files)}")
-        print(f"  Saida:       {Path(args.output_root).absolute()}")
-        print("=" * 60)
-
-        try:
-            confirm = input("\n  Iniciar pipeline? (S/n): ").strip().lower()
-            if confirm in ("n", "nao", "no"):
-                print("  Cancelado pelo usuario.")
-                sys.exit(0)
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Cancelado pelo usuario.")
-            sys.exit(0)
-
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    # Parse class map from CLI
-    class_map: Optional[Dict[str, str]] = None
+    class_map = None
     if args.class_map:
-        class_map = {}
-        for item in args.class_map:
-            if "=" in item:
-                key, val = item.split("=", 1)
-                class_map[key.strip()] = val.strip()
-        log.info(f"Class mapping: {class_map}")
+        class_map = {item.split("=")[0].strip(): item.split("=")[1].strip() for item in args.class_map if "=" in item}
 
-    # ────────────────────────────────────────────────────────────
-    # Phase 1: Process each dataset individually
-    # ────────────────────────────────────────────────────────────
-    dataset_dirs: List[Path] = []
+    if not args.files:
+        args.files = interactive_file_picker()
+        if not args.files: sys.exit(0)
+        args.output_root = interactive_output_picker()
 
+    dataset_dirs = []
     for filepath in args.files:
-        if not Path(filepath).exists():
-            log.error(f"File not found: {filepath}")
-            continue
-
-        result_dir = process_single_dataset(
+        if not Path(filepath).exists(): continue
+        res = process_single_dataset(
             path=filepath,
             output_root=output_root,
             no_interactive=args.no_interactive,
             condition_filter=args.condition_filter,
             class_map=class_map,
+            auto_add_healthy_control=args.auto_add_healthy_control,
+            strict_control_only=args.strict_control_only
         )
-        if result_dir is not None:
-            dataset_dirs.append(result_dir)
-
-    if not dataset_dirs:
-        log.error("No datasets processed successfully. Exiting.")
-        sys.exit(1)
-
-    # ────────────────────────────────────────────────────────────
-    # Phase 2: Merge + ComBat + Validation (if ≥ 2 datasets)
-    # ────────────────────────────────────────────────────────────
-    if len(dataset_dirs) >= 2:
-        # Merge
-        merged_raw, merged_zscore, merged_annot = merge_datasets(
-            dataset_dirs, output_root,
-        )
-
-        if merged_raw.empty:
-            log.error("Merge failed — no output generated.")
-            sys.exit(1)
-
-        # ComBat — applied to RAW (non-z-scored) merged data
-        # so that batch-mean differences are visible and correctable
-        expr_combat: Optional[pd.DataFrame] = None
-        if not args.no_combat and not args.zscore_only:
-            log.info("")
-            log.info("── ComBat Batch Correction ──")
-            expr_combat = apply_combat(merged_raw, merged_annot)
-
-            if expr_combat is not None:
-                expr_combat.to_csv(
-                    output_root / "merged_expression_combat.csv",
-                    index=False,
-                )
-                # Also produce a z-scored version of ComBat output
-                expr_combat_zscore = zscore_by_probe(expr_combat)
-                expr_combat_zscore.to_csv(
-                    output_root / "merged_expression_combat_zscore.csv",
-                    index=False,
-                )
-                log.info(
-                    "Saved: merged_expression_combat.csv, "
-                    "merged_expression_combat_zscore.csv"
-                )
-
-        # Purity validation — uses the RAW data (before/after ComBat)
-        log.info("")
-        log.info("── Purity Validation ──")
-        purity_df = compute_purity_metrics(
-            merged_raw, expr_combat, merged_annot,
-        )
-        purity_df.to_csv(
-            output_root / "purity_metrics.csv", index=False,
-        )
-
-        # Plots — show the RAW data before and ComBat output after
-        if not args.no_plots:
-            generate_all_plots(
-                merged_raw, expr_combat, merged_annot, output_root,
-            )
-
-    else:
-        log.info(
-            "Single dataset processed — "
-            "skipping merge / ComBat / purity steps."
-        )
-
-    # ────────────────────────────────────────────────────────────
-    # Final Summary
-    # ────────────────────────────────────────────────────────────
-    print("")
-    print("=" * 60)
-    print("  🎉 Pipeline completed successfully!")
-    print("=" * 60)
-    print(f"  📁 Output root: {output_root.absolute()}")
-    print(f"  📊 Datasets processed: {len(dataset_dirs)}")
-    for d in dataset_dirs:
-        n_csv = len(list(d.glob("*.csv")))
-        print(f"     └─ {d.name}/ ({n_csv} CSV files)")
+        if res: dataset_dirs.append(res)
 
     if len(dataset_dirs) >= 2:
-        print("  📊 Merged outputs:")
-        for fpath in sorted(output_root.glob("merged_*")):
-            size_kb = fpath.stat().st_size / 1024
-            print(f"     • {fpath.name} ({size_kb:.1f} KB)")
-        for fpath in sorted(output_root.glob("purity_*")):
-            print(f"     • {fpath.name}")
-        for fpath in sorted(output_root.glob("*.png")):
-            print(f"     🖼️ {fpath.name}")
+        merged_raw, merged_zscore, merged_annot = merge_datasets(dataset_dirs, output_root)
+        expr_combat = apply_combat(merged_raw, merged_annot) if not args.no_combat else None
+        if expr_combat is not None:
+            expr_combat.to_csv(output_root / "merged_expression_combat.csv", index=False)
+            zscore_by_probe(expr_combat).to_csv(output_root / "merged_expression_combat_zscore.csv", index=False)
+        compute_purity_metrics(merged_raw, expr_combat, merged_annot).to_csv(output_root / "purity_metrics.csv", index=False)
+        if not args.no_plots: generate_all_plots(merged_raw, expr_combat, merged_annot, output_root)
 
-    print("=" * 60)
-
+    print("\n✅ Pipeline completed!")
 
 if __name__ == "__main__":
     main()
