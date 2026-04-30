@@ -581,6 +581,35 @@ def zscore_by_probe(expr_df: pd.DataFrame) -> pd.DataFrame:
     return z_df
 
 
+def zscore_global(expr_df: pd.DataFrame) -> pd.DataFrame:
+    """Z-score por probe usando estatísticas da matriz merged (pós-ComBat).
+
+    Mesma mecânica de `zscore_by_probe`, mas aplicada à matriz global após
+    ComBat — é o que a literatura costuma chamar de "normalização final".
+    Só deve ser usada com strategy=combat_first, onde o z-score anterior
+    ao merge foi pulado e é seguro rescalonar no final.
+    """
+    return zscore_by_probe(expr_df)
+
+
+def quantile_normalize_global(expr_df: pd.DataFrame) -> pd.DataFrame:
+    """Quantile normalization via sklearn (distribuição normal alvo).
+
+    Aplica por coluna (amostras → distribuição idêntica), como é o uso
+    canônico em expressão gênica.
+    """
+    from sklearn.preprocessing import quantile_transform  # noqa: WPS433
+    n_quantiles = min(1000, expr_df.shape[1])
+    arr = quantile_transform(
+        expr_df.to_numpy(dtype=float),
+        n_quantiles=n_quantiles,
+        axis=1,
+        output_distribution="normal",
+        copy=True,
+    )
+    return pd.DataFrame(arr, index=expr_df.index, columns=expr_df.columns)
+
+
 # ========================================================================
 # 6. Anotação de amostras
 # ========================================================================
@@ -1101,6 +1130,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Pula geração de PCA")
     p.add_argument("--skip-merge", action="store_true",
                    help="Pula merge mesmo com múltiplos inputs")
+    # Estratégia de normalização cross-platform.
+    # - zscore_first: z-score por dataset → merge → ComBat (agressivo, baseline TCC2)
+    # - combat_first: merge raw log2 → ComBat → normalização final opcional
+    #   (linha de Müller et al. 2016, https://doi.org/10.1371/journal.pone.0156594)
+    p.add_argument("--strategy",
+                   choices=["zscore_first", "combat_first"],
+                   default="combat_first",
+                   help="Ordem de normalização cross-platform")
+    p.add_argument("--final-normalization",
+                   choices=["none", "zscore_global", "quantile"],
+                   default="none",
+                   help="Normalização pós-ComBat (só vale para combat_first)")
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
@@ -1150,8 +1191,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logger.info("ComBat pulado (--no-combat)")
         return 0
 
+    # Seleciona a matriz de entrada do ComBat conforme a estratégia.
+    # combat_first: ComBat roda na escala log2 original (desenho original do método).
+    # zscore_first: ComBat roda sobre z-scores por dataset (pipeline legado do TCC2).
+    if args.strategy == "combat_first":
+        combat_input = merged_raw
+        combat_input_label = "raw"
+    else:
+        combat_input = merged_expr
+        combat_input_label = "zscore"
+    logger.info("[strategy] %s → ComBat sobre merged_expression_%s.csv",
+                args.strategy, combat_input_label)
+
     try:
-        merged_combat = apply_combat(merged_expr, merged_annot,
+        merged_combat = apply_combat(combat_input, merged_annot,
                                      batch_col="batch", class_col="class_label")
     except ImportError as e:
         logger.error(str(e))
@@ -1163,26 +1216,51 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     merged_combat.to_csv(output_root / "merged_expression_combat.csv")
     logger.info("[combat] salvo merged_expression_combat.csv")
 
+    # --- Normalização final (somente combat_first) ------------------
+    final_norm = args.final_normalization
+    merged_final = merged_combat
+    final_path: Optional[Path] = None
+    if args.strategy == "combat_first" and final_norm != "none":
+        if final_norm == "zscore_global":
+            logger.info("[final] aplicando z-score global pós-ComBat")
+            merged_final = zscore_global(merged_combat)
+        elif final_norm == "quantile":
+            logger.info("[final] aplicando quantile normalization pós-ComBat")
+            merged_final = quantile_normalize_global(merged_combat)
+        final_path = output_root / f"merged_expression_final_{final_norm}.csv"
+        merged_final.to_csv(final_path)
+        logger.info("[final] salvo %s", final_path.name)
+    elif args.strategy == "zscore_first" and final_norm != "none":
+        logger.warning(
+            "[final] --final-normalization=%s ignorado "
+            "(só vale para strategy=combat_first)", final_norm,
+        )
+
     # --- Validação ---------------------------------------------------
+    # Para combat_first, merged_raw == combat_input → passar expr_raw=None
+    # evita duplicar o mesmo estágio na tabela de purity.
+    baseline_raw = merged_raw if args.strategy == "zscore_first" else None
     purity_df = purity_validation(
-        expr_before=merged_expr,
-        expr_after=merged_combat,
+        expr_before=combat_input,
+        expr_after=merged_final,
         sample_annot=merged_annot,
-        expr_raw=merged_raw,
+        expr_raw=baseline_raw,
     )
+    purity_df.insert(0, "strategy", args.strategy)
+    purity_df.insert(1, "final_normalization", final_norm)
     purity_df.to_csv(output_root / "purity_metrics.csv", index=False)
     logger.info("[purity] salvo purity_metrics.csv")
 
     # --- PCAs --------------------------------------------------------
     if not args.no_plots:
         generate_all_pca_plots(
-            expr_before=merged_expr,
-            expr_after=merged_combat,
+            expr_before=combat_input,
+            expr_after=merged_final,
             sample_annot=merged_annot,
             output_root=output_root,
         )
 
-    logger.info("Pipeline concluído com sucesso.")
+    logger.info("Pipeline concluído com sucesso (strategy=%s).", args.strategy)
     return 0
 
 
