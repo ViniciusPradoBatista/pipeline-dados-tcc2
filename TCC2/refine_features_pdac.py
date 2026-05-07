@@ -17,23 +17,18 @@
 """
 
 import argparse
-import logging
 import json
+import logging
 import sys
 from pathlib import Path
-from typing import Tuple, List, Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from boruta import BorutaPy
 from scipy import stats
-from statsmodels.stats.multitest import multipletests
 from sklearn.ensemble import RandomForestClassifier
-
-try:
-    from boruta import BorutaPy
-except ImportError:
-    print("❌ ERROR: 'boruta' package not found. Please install it using: pip install boruta")
-    sys.exit(1)
+from statsmodels.stats.multitest import multipletests
 
 # ── Logging ─────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -107,18 +102,22 @@ def load_and_align_data(
     annot_df = pd.read_csv(annot_path)
     
     # ── Verify expression format ──
-    if "Probe_ID" not in expr_df.columns:
-        raise ValueError("Expression matrix must contain a 'Probe_ID' column.")
-    
+    probe_col = next(
+        (c for c in ("Probe_ID", "Probe_ID_Canonical") if c in expr_df.columns),
+        None,
+    )
+    if probe_col is None:
+        raise ValueError("Expression matrix must contain a 'Probe_ID' or 'Probe_ID_Canonical' column.")
+
     # ── Verify annotation format ──
     if "sample_id" not in annot_df.columns:
         raise ValueError("Annotation file must contain a 'sample_id' column.")
     if target_col not in annot_df.columns:
         raise ValueError(f"Annotation file must contain target column '{target_col}'.")
-    
+
     # Transpose expression matrix: features in columns, samples in rows
     log.info("Transposing expression matrix to (samples x features)...")
-    expr_df = expr_df.set_index("Probe_ID")
+    expr_df = expr_df.set_index(probe_col)
     X_raw = expr_df.T
     X_raw.index.name = "sample_id"
     X_raw.reset_index(inplace=True)
