@@ -11,19 +11,21 @@
 """
 
 import argparse
-import logging
 import json
+import logging
 import sys
+import tkinter as tk
 import warnings
 from pathlib import Path
-from typing import Tuple, List, Optional, Dict
+from tkinter import filedialog
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy import stats
-from statsmodels.stats.multitest import multipletests
-from sklearn.linear_model import LogisticRegressionCV, LassoCV
+from sklearn.linear_model import LassoCV, LogisticRegressionCV
 from sklearn.preprocessing import StandardScaler
+from statsmodels.stats.multitest import multipletests
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -40,10 +42,8 @@ log = logging.getLogger("lasso_refinement")
 # =====================================================================
 
 def _try_file_picker(title: str, filetypes: list) -> Optional[str]:
-    """Try to open a tkinter file picker. Returns path or None."""
+    """Abre file picker tkinter. Retorna path ou None se diálogo falhar."""
     try:
-        import tkinter as tk
-        from tkinter import filedialog
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
@@ -55,10 +55,8 @@ def _try_file_picker(title: str, filetypes: list) -> Optional[str]:
 
 
 def _try_folder_picker(title: str) -> Optional[str]:
-    """Try to open a tkinter folder picker. Returns path or None."""
+    """Abre folder picker tkinter. Retorna path ou None se diálogo falhar."""
     try:
-        import tkinter as tk
-        from tkinter import filedialog
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
