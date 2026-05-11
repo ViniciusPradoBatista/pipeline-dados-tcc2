@@ -16,10 +16,45 @@ def detect_encoding(file_path: str) -> str:
     with open(file_path, "rb") as fh:
         raw = fh.read(2_000_000)
     result = chardet.detect(raw)
-    enc = result.get("encoding") or "latin-1"
+    enc = result.get("encoding")
     conf = result.get("confidence", "?")
+    
+    # Se detectou ascii mas falhar depois, o fallback tratará.
+    # Mas se retornar None, forçamos latin-1 como base.
+    if not enc:
+        enc = "latin-1"
+        
     log.info(f"Encoding detected: {enc} (confidence: {conf})")
     return enc
+
+
+def read_csv_robust(path: str, **kwargs) -> pd.DataFrame:
+    """
+    Tenta ler um CSV/TSV com fallbacks de encoding para evitar UnicodeDecodeError.
+    """
+    enc = detect_encoding(path)
+    
+    # Ordem de tentativa: Detectado -> UTF-8 -> Latin-1
+    encodings = [enc]
+    if enc.lower() not in ["utf-8", "utf-8-sig"]:
+        encodings.append("utf-8")
+    if "latin-1" not in [e.lower() for e in encodings]:
+        encodings.append("latin-1")
+
+    for e in encodings:
+        try:
+            kw = kwargs.copy()
+            kw["encoding"] = e
+            return pd.read_csv(path, **kw)
+        except (UnicodeDecodeError, TypeError):
+            continue
+
+    # Última tentativa com replace
+    log.warning(f"⚠️  Encoding failure for {path}. Forcing 'latin-1' with errors='replace'.")
+    kwargs["encoding"] = "latin-1"
+    if kwargs.get("engine") == "python":
+        kwargs["errors"] = "replace"
+    return pd.read_csv(path, **kwargs)
 
 
 def parse_series_metadata_tabular(path: str) -> pd.DataFrame:
@@ -71,9 +106,17 @@ def _build_metadata_df(data: List[Tuple[str, list]]) -> pd.DataFrame:
 
 def _parse_metadata_txt(path: str) -> pd.DataFrame:
     """Parseia metadados de um Series Matrix .txt."""
-    enc = detect_encoding(path)
-
     meta_lines: List[str] = []
+    
+    # Tentamos abrir com o encoding detectado, mas se falhar no open,
+    # usamos latin-1 que nunca falha (e errors='ignore' por segurança extra)
+    enc = detect_encoding(path)
+    try:
+        with open(path, "r", encoding=enc) as test_fh:
+            test_fh.readline()
+    except UnicodeDecodeError:
+        enc = "latin-1"
+
     with open(path, "r", encoding=enc, errors="ignore") as fh:
         for line in fh:
             if line.lower().startswith("!series_matrix_table_begin"):
