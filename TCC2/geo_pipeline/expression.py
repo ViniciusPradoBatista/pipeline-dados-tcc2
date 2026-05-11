@@ -9,7 +9,7 @@ import numpy as np
 import openpyxl
 import pandas as pd
 
-from geo_pipeline.io_geo import detect_encoding
+from geo_pipeline.io_geo import detect_encoding, read_csv_robust
 from geo_pipeline.parsing import smart_float
 
 log = logging.getLogger("geo_pipeline")
@@ -54,10 +54,10 @@ def read_expression(path: str) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
 
 def _read_expression_txt(path: str) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
     """Lê tabela de expressão de um Series Matrix .txt (tab-delimited)."""
-    enc = detect_encoding(path)
-
+    # Para encontrar o header, abrimos o arquivo com latin-1 (seguro para bytes)
+    # e buscamos por "ID_REF"
     header_idx = None
-    with open(path, "r", encoding=enc, errors="ignore") as fh:
+    with open(path, "r", encoding="latin-1", errors="ignore") as fh:
         for i, line in enumerate(fh):
             if "ID_REF" in line:
                 header_idx = i
@@ -66,13 +66,12 @@ def _read_expression_txt(path: str) -> Tuple[pd.DataFrame, pd.DataFrame, List[st
     if header_idx is None:
         raise ValueError("❌ Header containing 'ID_REF' not found in file")
 
-    df = pd.read_csv(
+    df = read_csv_robust(
         path,
         sep="\t",
         skiprows=header_idx,
         header=0,
         dtype=str,
-        encoding=enc,
         engine="python",
     )
 
