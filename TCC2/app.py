@@ -24,6 +24,12 @@ print("=" * 60)
 print("  Leitor Universal de Series Matrix (GEO)")
 print("  Suporta: Affymetrix, 3D-Gene, Agilent, Illumina, etc.")
 print("=" * 60)
+print()
+print("⚠️  AVISO: app.py é o script LEGADO deste pipeline.")
+print("   Para processamento completo e correto, use geo_mirna_pipeline.py.")
+print("   Este script não inclui: harmonização de Probe IDs cross-platform,")
+print("   detecção de escala robusta, ComBat, nem suporte a múltiplos datasets.")
+print("=" * 60)
 
 
 # =====================================================================
@@ -333,9 +339,24 @@ def read_expression_from_txt(path_txt):
     for c in gsm_cols:
         expr_num[c] = expr_num[c].apply(smart_float)
 
-    expr_log2 = expr_num.copy()
-    for c in gsm_cols:
-        expr_log2[c] = np.log2(expr_log2[c].clip(lower=0) + 1)
+    # Inferir escala antes de aplicar log2 (evitar double-log em dados já transformados)
+    flat_vals = np.concatenate([expr_num[c].dropna().values for c in gsm_cols if c in expr_num.columns])
+    flat_vals = flat_vals[np.isfinite(flat_vals)]
+    v_max = float(np.nanmax(flat_vals)) if len(flat_vals) > 0 else 0.0
+    v_min = float(np.nanmin(flat_vals)) if len(flat_vals) > 0 else 0.0
+
+    if v_max < 25 and v_min >= -5:
+        print(f"⚠️  AVISO: Valores máximos ({v_max:.2f}) sugerem que os dados JÁ estão em escala log2.")
+        print("   Transformação log2 NÃO será aplicada para evitar dupla transformação.")
+        print("   Se os dados forem lineares mesmo assim, use o pipeline geo_mirna_pipeline.py.")
+        expr_log2 = expr_num.copy()
+        already_log2 = True
+    else:
+        print(f"🔢 Aplicando transformação log2(x+1) (max={v_max:.1f})...")
+        expr_log2 = expr_num.copy()
+        for c in gsm_cols:
+            expr_log2[c] = np.log2(expr_log2[c].clip(lower=0) + 1)
+        already_log2 = False
 
     expr_text.to_csv(OUT_DIR / "expression_text_preservado.csv", index=False)
     expr_num.to_csv(OUT_DIR / "expression_numerico.csv", index=False)

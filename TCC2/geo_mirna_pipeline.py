@@ -7,11 +7,11 @@
     - Universal GEO Series Matrix reader (.txt and .xlsx)
     - Automatic platform detection and scale inference
     - Probe ID harmonization across platforms
-    - Z-score normalization per dataset
-    - Cross-dataset merge by common miRNAs
+    - Cross-dataset merge by common miRNAs (log2 scale)
     - ComBat batch correction (preserving biological signal)
-    - PurityB / PurityD validation
-    - PCA visualization
+    - Global z-score normalization AFTER ComBat (not per-dataset)
+    - PurityB / PurityD / Silhouette validation
+    - PCA visualization (PC1-PC2 and PC3-PC4)
     - Automatic inclusion of healthy controls
 
   Supported platforms:
@@ -111,9 +111,10 @@ def main() -> None:
             dataset_dirs.append(res)
 
     if len(dataset_dirs) >= 2:
-        merged_raw, merged_zscore, merged_annot = merge_datasets(
-            dataset_dirs, output_root
-        )
+        # merge_datasets retorna (merged_raw_log2, merged_annot)
+        # Sem z-score por dataset — o z-score global é calculado abaixo, após ComBat.
+        merged_raw, merged_annot = merge_datasets(dataset_dirs, output_root)
+
         expr_combat = (
             apply_combat(merged_raw, merged_annot) if not args.no_combat else None
         )
@@ -121,9 +122,12 @@ def main() -> None:
             expr_combat.to_csv(
                 output_root / "merged_expression_combat.csv", index=False
             )
+            # Z-score global calculado UMA VEZ sobre a matriz integrada pós-ComBat.
+            # Este é o único arquivo z-scored do pipeline (sem dupla aplicação).
             zscore_by_probe(expr_combat).to_csv(
                 output_root / "merged_expression_combat_zscore.csv", index=False
             )
+
         compute_purity_metrics(merged_raw, expr_combat, merged_annot).to_csv(
             output_root / "purity_metrics.csv", index=False
         )

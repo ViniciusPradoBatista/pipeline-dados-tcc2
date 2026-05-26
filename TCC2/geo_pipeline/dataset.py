@@ -17,7 +17,6 @@ from geo_pipeline.conditions import (
 from geo_pipeline.expression import read_expression
 from geo_pipeline.features import build_feature_map, build_sample_annotation
 from geo_pipeline.io_geo import parse_series_metadata_tabular
-from geo_pipeline.normalize import zscore_by_probe
 from geo_pipeline.scale import detect_platform, infer_scale
 
 log = logging.getLogger("geo_pipeline")
@@ -102,7 +101,16 @@ def process_single_dataset(
     filtered_gsms: set = set()
     for col in meta_filtered.columns:
         vals = meta_filtered[col].astype(str)
-        filtered_gsms.update(v for v in vals if v.startswith("GSM"))
+        # Limitar busca de GSMs a colunas reconhecidamente de ID de amostra,
+        # evitando incluir GSMs mencionados em campos de texto de descrição.
+        if any(k in col.lower() for k in ("geo_accession", "sample", "gsm")):
+            filtered_gsms.update(v for v in vals if v.startswith("GSM"))
+
+    # Fallback: buscar GSMs em todas as colunas se colunas específicas não retornaram nada
+    if not filtered_gsms:
+        for col in meta_filtered.columns:
+            vals = meta_filtered[col].astype(str)
+            filtered_gsms.update(v for v in vals if v.startswith("GSM"))
 
     if selected and filtered_gsms:
         keep_cols = [c for c in gsm_cols if c in filtered_gsms]
@@ -125,6 +133,13 @@ def process_single_dataset(
     if scale == "needs_log2":
         log.info("Applying log2(x + 1) transformation")
         for c in keep_cols:
+            n_neg = int((expr_ready[c] < 0).sum())
+            if n_neg > 0:
+                log.warning(
+                    f"Coluna {c}: {n_neg} valores negativos encontrados antes do log2. "
+                    f"Estes valores serão convertidos para 0 via clip(lower=0). "
+                    f"Verifique se a normalização do dataset introduziu artefatos de background."
+                )
             expr_ready[c] = np.log2(expr_ready[c].clip(lower=0) + 1)
     elif scale in ("already_log2", "already_processed"):
         log.info(f"Scale='{scale}' → no transformation applied")
@@ -150,17 +165,21 @@ def process_single_dataset(
 
     if expr_merge["Probe_ID"].duplicated().any():
         n_dup = expr_merge["Probe_ID"].duplicated().sum()
-        log.info(f"Averaging {n_dup} duplicate canonical Probe IDs")
-        expr_merge = expr_merge.groupby("Probe_ID", as_index=False)[keep_cols].mean()
+        log.info(
+            f"Colapsando {n_dup} Probe IDs canônicos duplicados usando mediana "
+            f"(mediana é mais robusta que média em escala log2 para probes heterogêneas)"
+        )
+        expr_merge = expr_merge.groupby("Probe_ID", as_index=False)[keep_cols].median()
 
     expr_merge = expr_merge[["Probe_ID"] + keep_cols]
 
-    # ── STEP 7: Z-score ──────────────────────────────────────────
-    log.info("── Step 7: Z-score normalization ──")
-    expr_zscore = zscore_by_probe(expr_merge)
+    # NOTA: O z-score NÃO é calculado aqui por dataset individual.
+    # O z-score global (calculado sobre todos os datasets integrados pós-ComBat)
+    # é produzido em geo_mirna_pipeline.py. Calcular z-score por dataset e
+    # depois concatenar produziria escalas incompatíveis entre datasets.
 
-    # ── STEP 8: Sample annotation ────────────────────────────────
-    log.info("── Step 8: Sample annotation ──")
+    # ── STEP 7: Sample annotation ────────────────────────────────
+    log.info("── Step 7: Sample annotation ──")
     sample_annot = build_sample_annotation(
         meta_filtered,
         keep_cols,
@@ -177,7 +196,6 @@ def process_single_dataset(
     expr_ready.to_csv(out_dir / "expression_analysis_ready.csv", index=False)
     feature_map.to_csv(out_dir / "feature_map.csv", index=False)
     expr_merge.to_csv(out_dir / "expression_merge_ready.csv", index=False)
-    expr_zscore.to_csv(out_dir / "expression_merge_ready_zscore.csv", index=False)
     sample_annot.to_csv(out_dir / "sample_annotation.csv", index=False)
 
     return out_dir
@@ -186,47 +204,56 @@ def process_single_dataset(
 def merge_datasets(
     dataset_dirs: List[Path],
     output_dir: Path,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Combina múltiplos datasets pelos miRNAs em comum."""
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Combina múltiplos datasets pelos miRNAs em comum (escala log2).
+
+    Retorna apenas os dados em escala log2 (sem z-score por dataset).
+    O z-score global é calculado em geo_mirna_pipeline.py após o ComBat,
+    garantindo que a normalização ocorra sobre a matriz integrada completa.
+    """
     log.info("")
     log.info("=" * 60)
     log.info("  MERGE: Combining datasets")
     log.info("=" * 60)
 
     all_raw: List[pd.DataFrame] = []
-    all_zscore: List[pd.DataFrame] = []
     all_annot: List[pd.DataFrame] = []
     all_mirna_sets: List[set] = []
 
     for d in dataset_dirs:
         raw_path = d / "expression_merge_ready.csv"
-        zscore_path = d / "expression_merge_ready_zscore.csv"
         annot_path = d / "sample_annotation.csv"
 
-        if not raw_path.exists() or not zscore_path.exists() or not annot_path.exists():
+        if not raw_path.exists() or not annot_path.exists():
+            log.warning(f"Dataset {d.name}: arquivos esperados não encontrados, pulando.")
             continue
 
         raw = pd.read_csv(raw_path)
-        zscore = pd.read_csv(zscore_path)
         annot = pd.read_csv(annot_path)
 
         mirnas = set(raw["Probe_ID"].unique())
         all_mirna_sets.append(mirnas)
         all_raw.append(raw)
-        all_zscore.append(zscore)
         all_annot.append(annot)
 
     if len(all_raw) < 2:
         if all_raw:
-            return all_raw[0], all_zscore[0], all_annot[0]
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+            log.warning(
+                "Apenas 1 dataset disponível para merge. Retornando sem merge. "
+                "ComBat não será necessário (sem efeito de batch a corrigir)."
+            )
+            return all_raw[0], all_annot[0]
+        return pd.DataFrame(), pd.DataFrame()
 
     common: set = all_mirna_sets[0]
     for s in all_mirna_sets[1:]:
         common = common.intersection(s)
 
     if not common:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        log.error("Nenhum miRNA em comum entre os datasets. Verifique a harmonização de Probe IDs.")
+        return pd.DataFrame(), pd.DataFrame()
+
+    log.info(f"miRNAs em comum entre {len(all_raw)} datasets: {len(common)}")
 
     def _merge_list(dfs: List[pd.DataFrame]) -> pd.DataFrame:
         parts = []
@@ -237,17 +264,15 @@ def merge_datasets(
         return pd.concat(parts, axis=1).reset_index()
 
     merged_raw = _merge_list(all_raw)
-    merged_zscore = _merge_list(all_zscore)
     merged_annot = pd.concat(all_annot, ignore_index=True)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     merged_raw.to_csv(output_dir / "merged_expression_raw.csv", index=False)
-    merged_zscore.to_csv(output_dir / "merged_expression_zscore.csv", index=False)
     merged_annot.to_csv(output_dir / "merged_sample_annotation.csv", index=False)
 
     log.info(
-        f"Samples by class after filtering: "
+        f"Samples by class after merge: "
         f"{merged_annot['class_label'].value_counts().to_dict()}"
     )
 
-    return merged_raw, merged_zscore, merged_annot
+    return merged_raw, merged_annot

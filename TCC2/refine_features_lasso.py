@@ -4,7 +4,16 @@
   For PDAC miRNA Classification
 
   Step A: Welch t-test + FDR (Benjamini-Hochberg)
-  Step B: LASSO via LogisticRegressionCV (L1) or LassoCV
+  Step B: LASSO via LogisticRegressionCV (L1) ou LassoCV
+
+  IMPORTANTE — Data Leakage Prevention:
+    Steps A e B aplicados EXCLUSIVAMENTE no conjunto de TREINO
+    (80% das amostras, split estratificado). O conjunto de TESTE
+    permanece completamente oculto durante a seleção de features.
+
+    O StandardScaler é aplicado via Pipeline do sklearn, garantindo
+    que a normalização seja aprendida apenas nos dados de treino
+    dentro de cada fold do cross-validation interno.
 
   Author: TCC Pipeline Downstream - LASSO variant
 ===================================================================
@@ -24,6 +33,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 from sklearn.linear_model import LassoCV, LogisticRegressionCV
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from statsmodels.stats.multitest import multipletests
 
@@ -42,7 +53,6 @@ log = logging.getLogger("lasso_refinement")
 # =====================================================================
 
 def _try_file_picker(title: str, filetypes: list) -> Optional[str]:
-    """Abre file picker tkinter. Retorna path ou None se diálogo falhar."""
     try:
         root = tk.Tk()
         root.withdraw()
@@ -55,7 +65,6 @@ def _try_file_picker(title: str, filetypes: list) -> Optional[str]:
 
 
 def _try_folder_picker(title: str) -> Optional[str]:
-    """Abre folder picker tkinter. Retorna path ou None se diálogo falhar."""
     try:
         root = tk.Tk()
         root.withdraw()
@@ -68,7 +77,6 @@ def _try_folder_picker(title: str) -> Optional[str]:
 
 
 def interactive_select_file(label: str) -> str:
-    """Interactively select a file via console menu."""
     print(f"\n{'─'*50}")
     print(f"  Selecionar: {label}")
     print(f"{'─'*50}")
@@ -86,7 +94,7 @@ def interactive_select_file(label: str) -> str:
             ft = [("CSV files", "*.csv"), ("All files", "*.*")]
             path = _try_file_picker(f"Selecione: {label}", ft)
             if path:
-                print(f"  ✅ {Path(path).name}")
+                print(f"  OK: {Path(path).name}")
                 return path
             print("  Seletor nao disponivel. Digite o caminho:")
             choice = "2"
@@ -97,13 +105,12 @@ def interactive_select_file(label: str) -> str:
             except (EOFError, KeyboardInterrupt):
                 sys.exit(0)
             if path and Path(path).exists():
-                print(f"  ✅ {Path(path).name}")
+                print(f"  OK: {Path(path).name}")
                 return path
-            print("  ❌ Arquivo nao encontrado. Tente novamente.")
+            print("  Arquivo nao encontrado. Tente novamente.")
 
 
 def interactive_select_output() -> str:
-    """Interactively select output directory."""
     print(f"\n{'─'*50}")
     print("  Onde salvar os resultados?")
     print(f"{'─'*50}")
@@ -136,19 +143,9 @@ def interactive_select_output() -> str:
 # =====================================================================
 
 def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments. All paths are optional for interactive mode."""
     parser = argparse.ArgumentParser(
         description="Feature Selection with LASSO for PDAC miRNA Data",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # CLI mode:
-  python refine_features_lasso.py --expr-path merged_expression_combat.csv \\
-      --annot-path merged_sample_annotation.csv --output-dir ./lasso_out
-
-  # Interactive mode:
-  python refine_features_lasso.py
-        """,
     )
     parser.add_argument("--expr-path", default=None, type=str)
     parser.add_argument("--annot-path", default=None, type=str)
@@ -164,6 +161,8 @@ Examples:
                         choices=["logistic_l1", "lasso_cv"])
     parser.add_argument("--cv-folds", default=5, type=int)
     parser.add_argument("--random-state", default=42, type=int)
+    parser.add_argument("--test-size", default=0.2, type=float,
+                        help="Fracao de amostras reservada para o conjunto de teste (default: 0.2).")
     return parser.parse_args()
 
 
@@ -175,7 +174,6 @@ def load_and_align_data(
     expr_path: str, annot_path: str,
     target_col: str, pos_class: str, neg_class: str,
 ) -> Tuple[pd.DataFrame, pd.Series]:
-    """Load, transpose, align, and encode data."""
     log.info(f"Loading expression: {expr_path}")
     expr_df = pd.read_csv(expr_path)
 
@@ -214,7 +212,6 @@ def load_and_align_data(
 
 
 def validate_data(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
-    """Validate and clean X."""
     log.info("Validating data...")
 
     nan_count = X.isna().sum().sum()
@@ -244,7 +241,6 @@ def validate_data(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
 # =====================================================================
 
 def calculate_cohens_d(g1: np.ndarray, g2: np.ndarray) -> float:
-    """Cohen's d effect size."""
     n1, n2 = len(g1), len(g2)
     v1, v2 = np.var(g1, ddof=1), np.var(g2, ddof=1)
     if v1 == 0 and v2 == 0:
@@ -257,8 +253,12 @@ def differential_expression_filter(
     X: pd.DataFrame, y: pd.Series,
     p_thresh: float, eff_thresh: float, use_zscore: bool,
 ) -> pd.DataFrame:
-    """Step A: Welch t-test + FDR filtering."""
-    log.info("── Step A: Statistical Filtering ──")
+    """
+    Step A: Welch t-test + FDR Benjamini-Hochberg.
+
+    IMPORTANTE: recebe apenas o CONJUNTO DE TREINO.
+    """
+    log.info("── Step A: Statistical Filtering (apenas dados de TREINO) ──")
     log.info(f"  Thresholds: p_adj < {p_thresh}, |effect| > {eff_thresh}")
 
     pdac_mask = y == 1
@@ -303,21 +303,36 @@ def lasso_logistic_l1(
     X: pd.DataFrame, y: pd.Series,
     cv_folds: int, random_state: int,
 ) -> Tuple[List[str], pd.DataFrame, dict]:
-    """LASSO via LogisticRegressionCV with L1 penalty."""
-    log.info("── Step B: Logistic Regression L1 (LASSO) ──")
+    """
+    LASSO via LogisticRegressionCV com penalidade L1.
+
+    O StandardScaler é integrado em um Pipeline do sklearn, garantindo
+    que a média e o desvio padrão sejam aprendidos apenas nos dados de
+    treino de cada fold interno do cross-validation — sem data leakage.
+
+    IMPORTANTE: recebe apenas o CONJUNTO DE TREINO.
+    """
+    log.info("── Step B: Logistic Regression L1 (LASSO) — apenas dados de TREINO ──")
     log.info(f"  CV folds: {cv_folds}, solver: saga")
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    pipeline = Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", LogisticRegressionCV(
+            penalty="l1",
+            solver="saga",
+            cv=cv_folds,
+            class_weight="balanced",
+            random_state=random_state,
+            max_iter=10000,
+            scoring="roc_auc",
+            Cs=20,
+            n_jobs=-1,
+        )),
+    ])
 
-    model = LogisticRegressionCV(
-        penalty="l1", solver="saga", cv=cv_folds,
-        class_weight="balanced", random_state=random_state,
-        max_iter=10000, scoring="roc_auc",
-        Cs=20, n_jobs=-1,
-    )
-    model.fit(X_scaled, y)
+    pipeline.fit(X.values, y.values)
 
+    model = pipeline.named_steps["clf"]
     best_C = float(model.C_[0])
     coefs = model.coef_[0]
     log.info(f"  Best C (inverse regularization): {best_C:.6f}")
@@ -330,9 +345,9 @@ def lasso_logistic_l1(
 
     nonzero_mask = coef_df["abs_coefficient"] > 0
     selected = coef_df.loc[nonzero_mask, "miRNA"].tolist()
-    n_zero = (~nonzero_mask).sum()
-    n_pos = (coef_df["coefficient"] > 0).sum()
-    n_neg = (coef_df["coefficient"] < 0).sum()
+    n_zero = int((~nonzero_mask).sum())
+    n_pos = int((coef_df["coefficient"] > 0).sum())
+    n_neg = int((coef_df["coefficient"] < 0).sum())
 
     log.info(f"  Non-zero coefficients: {len(selected)}")
     log.info(f"  Zero coefficients: {n_zero}")
@@ -342,9 +357,9 @@ def lasso_logistic_l1(
         "mode": "logistic_l1",
         "best_C": best_C,
         "nonzero": len(selected),
-        "zero": int(n_zero),
-        "positive": int(n_pos),
-        "negative": int(n_neg),
+        "zero": n_zero,
+        "positive": n_pos,
+        "negative": n_neg,
     }
     return selected, coef_df, meta
 
@@ -353,17 +368,32 @@ def lasso_cv_regression(
     X: pd.DataFrame, y: pd.Series,
     cv_folds: int, random_state: int,
 ) -> Tuple[List[str], pd.DataFrame, dict]:
-    """Alternative: LassoCV (linear regression). Less ideal for classification."""
-    log.info("── Step B: LassoCV (regression mode) ──")
-    log.warning("  ⚠️ LassoCV is a regression method. For binary classification,")
-    log.warning("     logistic_l1 is more appropriate. Use this for ranking only.")
+    """
+    Alternativa: LassoCV (regressão linear).
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    AVISO CIENTIFICO: LassoCV é um método de REGRESSÃO LINEAR. Para
+    classificação binária (PDAC vs Control), o LogisticRegressionCV com
+    L1 (logistic_l1) é cientificamente mais adequado, pois respeita a
+    natureza binária da variável resposta. Use este modo apenas para
+    ranking exploratório de features, NUNCA para avaliação de modelos.
 
-    model = LassoCV(cv=cv_folds, random_state=random_state, max_iter=10000, n_jobs=-1)
-    model.fit(X_scaled, y)
+    O StandardScaler é aplicado via Pipeline para evitar data leakage.
 
+    IMPORTANTE: recebe apenas o CONJUNTO DE TREINO.
+    """
+    log.info("── Step B: LassoCV (modo regressão) — apenas dados de TREINO ──")
+    log.warning("  AVISO CIENTIFICO: LassoCV e um metodo de regressao linear.")
+    log.warning("  Para classificacao binaria, logistic_l1 e mais adequado.")
+    log.warning("  Use este modo apenas para ranking exploratorio de features.")
+
+    pipeline = Pipeline([
+        ("scaler", StandardScaler()),
+        ("lasso", LassoCV(cv=cv_folds, random_state=random_state, max_iter=10000, n_jobs=-1)),
+    ])
+
+    pipeline.fit(X.values, y.values)
+
+    model = pipeline.named_steps["lasso"]
     best_alpha = float(model.alpha_)
     coefs = model.coef_
     log.info(f"  Best alpha: {best_alpha:.6f}")
@@ -395,7 +425,6 @@ def lasso_cv_regression(
 def main():
     args = parse_args()
 
-    # ── Interactive mode if paths not provided ──
     if not args.expr_path:
         print("\n" + "=" * 55)
         print("  LASSO Feature Selection for PDAC miRNA")
@@ -408,7 +437,6 @@ def main():
     if not args.output_dir:
         args.output_dir = interactive_select_output()
 
-    # Verify files exist
     if not Path(args.expr_path).exists():
         log.error(f"File not found: {args.expr_path}")
         sys.exit(1)
@@ -419,7 +447,6 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Show config summary in interactive mode
     print(f"\n{'='*55}")
     print(f"  Expressao : {Path(args.expr_path).name}")
     print(f"  Annotation: {Path(args.annot_path).name}")
@@ -427,6 +454,7 @@ def main():
     print(f"  LASSO mode: {args.lasso_mode}")
     print(f"  CV folds  : {args.cv_folds}")
     print(f"  Z-Score   : {args.use_zscore}")
+    print(f"  Test size : {args.test_size*100:.0f}% holdout estratificado")
     print(f"{'='*55}")
 
     log.info("=" * 60)
@@ -446,50 +474,85 @@ def main():
     # ── 2. Validate ──
     X = validate_data(X_raw, y)
 
-    # ── 3. Step A ──
+    # ── 3. Holdout Split (ANTES de qualquer seleção de features) ──
+    log.info("── Split estratificado 80/20 (evita data leakage) ──")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=args.test_size,
+        random_state=args.random_state,
+        stratify=y,
+    )
+    log.info(
+        f"Train: {X_train.shape[0]} amostras "
+        f"(PDAC={int((y_train==1).sum())}, Control={int((y_train==0).sum())})"
+    )
+    log.info(
+        f"Test:  {X_test.shape[0]} amostras "
+        f"(PDAC={int((y_test==1).sum())}, Control={int((y_test==0).sum())})"
+    )
+
+    # ── 4. Step A (SOMENTE nos dados de treino) ──
     stats_df = differential_expression_filter(
-        X, y, args.p_val_thresh, args.effect_thresh, args.use_zscore,
+        X_train, y_train, args.p_val_thresh, args.effect_thresh, args.use_zscore,
     )
     features_a = stats_df.loc[stats_df["selected_step_a"], "miRNA"].tolist()
 
     if len(features_a) == 0:
-        log.warning("Step A: 0 features passed. Fallback: top 100 by p_adj.")
-        features_a = stats_df.sort_values("p_adj")["miRNA"].head(100).tolist()
+        log.error("=" * 60)
+        log.error("FALHA NO STEP A: Nenhuma feature passou o filtro FDR + efeito!")
+        log.error("Possíveis causas:")
+        log.error("  - Dados insuficientes (poucos samples no treino)")
+        log.error("  - Threshold muito restritivo (tente reduzir p-val-thresh ou effect-thresh)")
+        log.error("  - Ausência de sinal biológico real neste dataset")
+        log.error("FALLBACK: usando Top-50 features por p_adj (NÃO são estatisticamente significativas).")
+        log.error("Os resultados downstream devem ser interpretados com extrema cautela.")
+        log.error("=" * 60)
+        features_a = stats_df.sort_values("p_adj")["miRNA"].head(50).tolist()
 
-    X_a = X[features_a]
+    X_train_a = X_train[features_a]
     log.info(f"Step A output: {len(features_a)} features")
 
-    # ── 4. Step B: LASSO ──
+    # ── 5. Step B: LASSO (SOMENTE nos dados de treino) ──
     if args.lasso_mode == "logistic_l1":
         features_b, coef_df, lasso_meta = lasso_logistic_l1(
-            X_a, y, args.cv_folds, args.random_state,
+            X_train_a, y_train, args.cv_folds, args.random_state,
         )
     else:
         features_b, coef_df, lasso_meta = lasso_cv_regression(
-            X_a, y, args.cv_folds, args.random_state,
+            X_train_a, y_train, args.cv_folds, args.random_state,
         )
 
     if len(features_b) == 0:
-        log.warning("LASSO selected 0 features. Falling back to Step A.")
+        log.warning("LASSO selecionou 0 features. Usando features do Step A como fallback.")
         features_b = features_a
 
-    X_final = X[features_b].copy()
+    # ── 6. Aplicar features ao treino E ao teste ──
+    X_train_final = X_train[features_b].copy()
+    X_test_final = X_test[features_b].copy()
 
-    # ── 5. Save outputs ──
+    # ── 7. Save outputs ──
     log.info("── Saving Outputs ──")
 
     stats_df.to_csv(out_dir / "differential_expression_results.csv", index=False)
-    pd.Series(features_a, name="miRNA").to_csv(
-        out_dir / "selected_miRNAs_step_a.csv", index=False,
-    )
-    pd.Series(features_b, name="miRNA").to_csv(
-        out_dir / "selected_miRNAs_step_b.csv", index=False,
-    )
+    pd.Series(features_a, name="miRNA").to_csv(out_dir / "selected_miRNAs_step_a.csv", index=False)
+    pd.Series(features_b, name="miRNA").to_csv(out_dir / "selected_miRNAs_step_b.csv", index=False)
     coef_df.to_csv(out_dir / "lasso_coefficients.csv", index=False)
 
-    final_ds = X_final.copy()
-    final_ds["target"] = y.values
-    final_ds.to_csv(out_dir / "base_pronta_para_treinamento.csv", index=True)
+    # Conjunto de treino
+    train_ds = X_train_final.copy()
+    train_ds["target"] = y_train.values
+    train_ds["split"] = "train"
+    train_ds.to_csv(out_dir / "base_treino.csv", index=True)
+
+    # Conjunto de teste (mantido oculto durante seleção de features)
+    test_ds = X_test_final.copy()
+    test_ds["target"] = y_test.values
+    test_ds["split"] = "test"
+    test_ds.to_csv(out_dir / "base_teste.csv", index=True)
+
+    # Base combinada
+    full_ds = pd.concat([train_ds, test_ds])
+    full_ds.to_csv(out_dir / "base_pronta_para_treinamento.csv", index=True)
 
     with open(out_dir / "selected_feature_names.txt", "w") as f:
         f.write("\n".join(features_b))
@@ -499,13 +562,18 @@ def main():
         f"Feature Selection Report (LASSO)\n"
         f"================================\n"
         f"Initial miRNAs        : {initial_features}\n"
-        f"PDAC Samples          : {n_pdac}\n"
-        f"Control Samples       : {n_ctrl}\n"
+        f"PDAC Samples (total)  : {n_pdac}\n"
+        f"Control Samples (total): {n_ctrl}\n"
+        f"Train samples         : {X_train.shape[0]}\n"
+        f"Test samples          : {X_test.shape[0]}\n"
         f"Remaining after Step A: {len(features_a)}\n"
         f"Remaining after Step B: {len(features_b)}\n"
         f"LASSO mode            : {args.lasso_mode}\n"
         f"Chosen regularization : {reg_label}\n"
         f"Non-zero coefficients : {lasso_meta['nonzero']}\n"
+        f"\nNOTA: Step A e Step B foram aplicados APENAS no conjunto de treino.\n"
+        f"O conjunto de teste em base_teste.csv deve ser usado para avaliacao\n"
+        f"nao-enviesada do classificador downstream.\n"
     )
     with open(out_dir / "feature_counts_report.txt", "w") as f:
         f.write(report)
@@ -514,6 +582,8 @@ def main():
         "samples_total": int(X.shape[0]),
         "samples_pdac": n_pdac,
         "samples_control": n_ctrl,
+        "samples_train": int(X_train.shape[0]),
+        "samples_test": int(X_test.shape[0]),
         "features_initial": initial_features,
         "features_after_step_a": len(features_a),
         "features_after_step_b": len(features_b),
@@ -526,13 +596,14 @@ def main():
             "lasso_mode": args.lasso_mode,
             "cv_folds": args.cv_folds,
             "random_state": args.random_state,
+            "test_size": args.test_size,
         },
     }
     with open(out_dir / "feature_selection_summary.json", "w") as f:
         json.dump(summary, f, indent=4)
 
     log.info(report)
-    log.info(f"✅ All files saved to: {out_dir.absolute()}")
+    log.info(f"Arquivos salvos em: {out_dir.absolute()}")
     log.info("=" * 60)
 
 

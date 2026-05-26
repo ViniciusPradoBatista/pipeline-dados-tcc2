@@ -1,6 +1,6 @@
 """Plataformas GEO conhecidas e sinônimos de condição usados no pipeline."""
 
-from typing import Dict
+from typing import Dict, Set
 
 KNOWN_PLATFORMS: Dict[str, str] = {
     "GPL19117": "Affymetrix miRNA 4.0 (multispecies)",
@@ -14,12 +14,17 @@ KNOWN_PLATFORMS: Dict[str, str] = {
     "GPL11487": "Agilent Human miRNA V4",
     "GPL7731": "Agilent Human miRNA V1",
     "GPL8179": "Illumina Human v2",
-    "GPL6480": "Agilent Whole Human Genome",
-    "GPL570": "Affymetrix HG-U133 Plus 2.0",
-    "GPL96": "Affymetrix HG-U133A",
+    # --- plataformas de mRNA (não de miRNA) ---
+    "GPL6480": "Agilent Whole Human Genome (mRNA — NÃO é miRNA)",
+    "GPL570": "Affymetrix HG-U133 Plus 2.0 (mRNA — NÃO é miRNA)",
+    "GPL96": "Affymetrix HG-U133A (mRNA — NÃO é miRNA)",
 }
 
+# Plataformas de mRNA que NÃO devem ser usadas neste pipeline de miRNA.
+MRNA_PLATFORMS: Set[str] = {"GPL6480", "GPL570", "GPL96"}
+
 HEALTHY_SYNONYMS_STRICT = [
+    "healthy",
     "healthy control",
     "healthy controls",
     "healthy subject",
@@ -39,6 +44,9 @@ HEALTHY_SYNONYMS_BROAD = [
     "benign control",
 ]
 
+# NOTA: "disease" e "diseases" foram removidos intencionalmente pois o campo GEO
+# "disease state: normal" ou "disease state: healthy" contém o termo "disease"
+# mas representa amostras de CONTROLE, não patológicas.
 PATHOLOGICAL_SYNONYMS = [
     "cancer",
     "carcinoma",
@@ -50,6 +58,4 @@ PATHOLOGICAL_SYNONYMS = [
     "pdac",
     "pancreatic cancer",
     "cholangiocarcinoma",
-    "disease",
-    "diseases",
 ]

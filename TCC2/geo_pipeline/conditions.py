@@ -18,15 +18,25 @@ log = logging.getLogger("geo_pipeline")
 
 def normalize_condition(value: str) -> str:
     """
-    Remove sufixos de IDs individuais de uma string de condição.
+    Remove sufixos de IDs individuais de paciente de uma string de condição.
+
+    Requer pelo menos 1 letra maiúscula antes dos dígitos para evitar remover
+    informação biológica como estadiamentos numéricos ("Stage 4" é preservado,
+    "pancreatic cancer P75" perde o "P75").
 
     Examples:
         "pancreatic cancer P75"     → "pancreatic cancer"
         "healthy control E001"      → "healthy control"
         "biliary tract cancer B101" → "biliary tract cancer"
+        "Stage 4"                   → "Stage 4"  (preservado)
     """
-    normalized = re.sub(r"\s+[A-Z]{0,2}\d{1,4}\s*$", "", value.strip())
+    normalized = re.sub(r"\s+[A-Z]{1,2}\d{1,4}\s*$", "", value.strip())
     return normalized.strip()
+
+
+def _word_boundary_contains(text: str, term: str) -> bool:
+    """Verifica se `term` aparece em `text` com word boundaries (não como substring de outra palavra)."""
+    return bool(re.search(r"(?<![a-z])" + re.escape(term) + r"(?![a-z])", text))
 
 
 def extract_sample_condition(
@@ -40,6 +50,7 @@ def extract_sample_condition(
         1. Coluna characteristics contendo "disease state: …"
         2. source_name com condição entre parênteses
         3. title (normalizado)
+        4. description (fallback — útil quando title é genérico, e.g. GSE85589)
     """
     for col in all_columns:
         if "characteristics" not in col.lower():
@@ -55,17 +66,41 @@ def extract_sample_condition(
         m = re.search(r"\(([^)]+)\)", val)
         if m:
             return m.group(1).strip()
-        if val and val.lower() not in ("", "nan", "none", "serum", "plasma", "blood"):
+        if val and val.lower() not in ("", "nan", "none", "serum", "plasma", "blood",
+                                       "rna", "tissue", "cfdna", "cfrna"):
             return val
 
+    title_result = ""
     for col in all_columns:
         if "title" not in col.lower():
             continue
         val = str(meta_row.get(col, "")).strip().strip('"')
         if val and val.lower() not in ("", "nan", "none"):
-            return normalize_condition(val)
+            title_result = normalize_condition(val)
+            break
 
-    return ""
+    # 4. description — fallback when title is uninformative (e.g. "miRNA from N1")
+    for col in all_columns:
+        if "description" not in col.lower():
+            continue
+        val = str(meta_row.get(col, "")).strip().strip('"')
+        if val and val.lower() not in ("", "nan", "none"):
+            desc_norm = normalize_condition(val)
+            # Title is considered "descriptive" (and preferred) only when:
+            # - it is longer than 3 words
+            # - does NOT look like a sample descriptor ("miRNA from ...", "RNA from ...")
+            # - does NOT contain " from " (which signals a sample name, not a condition)
+            title_looks_descriptive = bool(
+                title_result
+                and len(title_result.split()) > 3
+                and " from " not in title_result.lower()
+                and not title_result.lower().startswith(("mirna", "rna", "cdna", "serum", "plasma"))
+            )
+            if title_looks_descriptive:
+                return title_result
+            return desc_norm
+
+    return title_result
 
 
 def extract_conditions(
@@ -73,9 +108,6 @@ def extract_conditions(
 ) -> Tuple[List[Tuple[str, int]], List[str]]:
     """
     Extrai condições únicas dos metadados, agrupadas por doença/categoria.
-
-    Usa a lógica per-sample (extract_sample_condition) para agrupar amostras
-    pela categoria real em vez de mostrar entradas individuais por paciente.
 
     Returns:
         grouped    – lista de (nome_condição, contagem) ordenada por contagem desc
@@ -195,14 +227,8 @@ def auto_include_healthy_controls(
     Detecta e inclui automaticamente grupos de controle saudável quando uma
     condição patológica foi selecionada.
 
-    Args:
-        selected_conditions: condições escolhidas pela usuária.
-        grouped_conditions: todas as condições disponíveis no dataset.
-        strict_control_only: se True, só aceita rótulos explícitos
-            'healthy/normal'.
-
-    Returns:
-        Lista de condições atualizada incluindo controles auto-detectados.
+    Usa word-boundary matching para evitar falsos positivos como
+    "non-cancer control" sendo detectado ao buscar "cancer".
     """
     final_selection = list(selected_conditions)
     all_available = [c[0] for c in grouped_conditions]
@@ -210,7 +236,7 @@ def auto_include_healthy_controls(
     is_pathological = False
     for sel in selected_conditions:
         sel_lower = sel.lower()
-        if any(term in sel_lower for term in PATHOLOGICAL_SYNONYMS):
+        if any(_word_boundary_contains(sel_lower, term) for term in PATHOLOGICAL_SYNONYMS):
             is_pathological = True
             break
 
@@ -227,7 +253,7 @@ def auto_include_healthy_controls(
         if any(term == sel_lower for term in all_healthy_terms):
             control_already_selected = True
             break
-        if any(term in sel_lower for term in all_healthy_terms):
+        if any(_word_boundary_contains(sel_lower, term) for term in all_healthy_terms):
             control_already_selected = True
             break
 
@@ -243,10 +269,11 @@ def auto_include_healthy_controls(
 
     for term in search_list:
         for available in all_available:
-            if term == available.lower():
+            avail_lower = available.lower()
+            if term == avail_lower:
                 found_control = available
                 break
-            if term in available.lower():
+            if _word_boundary_contains(avail_lower, term):
                 found_control = available
                 break
         if found_control:
@@ -268,8 +295,12 @@ def filter_samples_by_conditions(
     condition_cols: List[str],
 ) -> pd.DataFrame:
     """
-    Filtra linhas de metadados que casam com qualquer das condições selecionadas
-    (case-insensitive, substring match).
+    Filtra linhas de metadados que casam com qualquer das condições selecionadas.
+
+    Estratégia (em ordem de prioridade):
+    1. Match exato da condição normalizada (mais seguro).
+    2. Word-boundary match (evita "cancer" casar com "non-cancer control").
+    3. Fallback: busca em todas as colunas com word boundaries.
     """
     if conditions is None:
         log.info(f"Using ALL {meta_df.shape[0]} samples (no filter)")
@@ -279,22 +310,32 @@ def filter_samples_by_conditions(
 
     for cond in conditions:
         cond_lower = cond.lower()
+        cond_pattern = r"(?<![a-z])" + re.escape(cond_lower) + r"(?![a-z])"
+
         for col in condition_cols:
-            col_mask = (
-                meta_df[col]
-                .astype(str)
-                .str.lower()
-                .str.contains(re.escape(cond_lower), na=False)
+            col_vals = meta_df[col].astype(str)
+
+            # 1. Match exato da condição normalizada
+            exact_mask = col_vals.apply(
+                lambda v: normalize_condition(v.strip().strip('"')).lower() == cond_lower
             )
-            mask = mask | col_mask
+            # 2. Word-boundary substring match
+            boundary_mask = col_vals.str.lower().str.contains(
+                cond_pattern, na=False, regex=True
+            )
+            mask = mask | exact_mask | boundary_mask
 
     if mask.sum() == 0:
-        log.warning("Primary columns had no matches; searching all columns")
-        df_str = meta_df.astype(str).apply(lambda x: x.str.lower())
+        log.warning(
+            "Nenhuma amostra encontrada nas colunas de condição. "
+            "Buscando em todas as colunas com word boundaries..."
+        )
         for cond in conditions:
             cond_lower = cond.lower()
-            mask = mask | df_str.apply(
-                lambda row: cond_lower in " ".join(row.values), axis=1
+            cond_pattern = r"(?<![a-z])" + re.escape(cond_lower) + r"(?![a-z])"
+            mask = mask | meta_df.astype(str).apply(
+                lambda row: bool(re.search(cond_pattern, " ".join(row.values).lower())),
+                axis=1,
             )
 
     filtered = meta_df.loc[mask].copy()
