@@ -69,11 +69,6 @@ Reflete o código atual (pós-correção de vazamento). Etapas mapeadas para arq
 ═══════════════════════════════════════════════════════════════════════════════
 ```
 
-> As análises de robustez metodológica (confound de plataforma, avaliação
-> within-platform, confound de scan-batch) foram conduzidas durante a investigação
-> e **viram discussão no texto do TCC** — não fazem parte do código do pipeline.
-> Ficam preservadas na tag git `snapshot-2026-06-06-robustez` e na cópia de segurança.
-
 ## Versão Mermaid
 
 ```mermaid
