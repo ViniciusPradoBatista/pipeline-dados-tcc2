@@ -135,6 +135,16 @@ def build_sample_annotation(
             if any(term in condition_normalized.lower() for term in all_healthy):
                 class_label = "Control"
 
+        # Fail-loud: amostra sem condição/metadata recebe rótulo EXPLÍCITO "Unknown"
+        # (não string vazia silenciosa). O Estágio 2 filtra por {PDAC, Control}, então
+        # essas amostras "fantasma" são naturalmente excluídas — mas de forma rastreável.
+        if not str(class_label).strip():
+            log.warning(
+                f"Amostra {gsm_id} sem condição/metadata correspondente — "
+                f"class_label='Unknown' (será excluída do Estágio 2)."
+            )
+            class_label = "Unknown"
+
         records.append(
             {
                 "sample_id": gsm_id,

@@ -1,4 +1,9 @@
-"""Módulo F — normalize.py — Validação técnica."""
+"""Módulo F — normalize.py (API fit/apply, sem vazamento) — Validação técnica.
+
+As funções legadas apply_combat/zscore_by_probe (que ajustavam sobre a matriz
+inteira) foram REMOVIDAS. Este módulo valida a API fit/apply que estima parâmetros
+só no treino.
+"""
 
 import sys
 from pathlib import Path
@@ -10,7 +15,12 @@ import inspect  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from geo_pipeline.normalize import apply_combat, zscore_by_probe  # noqa: E402
+from geo_pipeline.normalize import (  # noqa: E402
+    apply_zscore,
+    combat_apply,
+    combat_fit,
+    fit_zscore,
+)
 
 
 def report(name, passed, details):
@@ -19,122 +29,118 @@ def report(name, passed, details):
     print(f"  {details}")
 
 
-# ─── F.1: zscore por probe (linha) vs por amostra (coluna)? ─────────
+def _expr(n_probes, cols, seed):
+    rng = np.random.default_rng(seed)
+    data = rng.normal(loc=5.0, scale=2.0, size=(n_probes, len(cols)))
+    return pd.DataFrame(data, index=pd.Index([f"p{i}" for i in range(n_probes)],
+                                             name="Probe_ID"), columns=cols)
+
+
+# ─── F.0: as funções legadas que vazavam NÃO existem mais ────────────
+def test_f0_legacy_removed():
+    import geo_pipeline.normalize as nz
+    has_legacy = hasattr(nz, "apply_combat") or hasattr(nz, "zscore_by_probe")
+    report(
+        "F.0 funções legadas (apply_combat/zscore_by_probe) removidas",
+        not has_legacy,
+        f"apply_combat presente={hasattr(nz, 'apply_combat')}, "
+        f"zscore_by_probe presente={hasattr(nz, 'zscore_by_probe')}. "
+        f"Ambas devem estar ausentes — vaziam ao ajustar sobre a matriz inteira.",
+    )
+
+
+# ─── F.1: fit_zscore/apply_zscore normalizam por probe (LINHA) ───────
 def test_f1_zscore_axis():
-    """O zscore_by_probe normaliza CADA probe ao longo das amostras (linhas).
+    """fit_zscore calcula mu/sd por probe (linha) ao longo das amostras de treino;
+    apply_zscore reaplica → cada probe fica com mean≈0, std≈1 no treino."""
+    train = _expr(10, [f"GSM{i}" for i in range(5)], seed=42)
 
-    Para microarray miRNA, a convenção comum é:
-    - z-score por feature (gene/probe): feature ~ N(0,1) ao longo das amostras
-    - z-score por amostra: amostra ~ N(0,1) ao longo das features
+    mu, sd = fit_zscore(train)
+    z = apply_zscore(train, mu, sd).values
 
-    O nome `zscore_by_probe` sugere o primeiro. Verificar empiricamente.
-    """
-    rng = np.random.default_rng(42)
-    data = rng.normal(loc=5.0, scale=2.0, size=(10, 5))
-    df = pd.DataFrame(data, columns=["GSM1", "GSM2", "GSM3", "GSM4", "GSM5"])
-    df.insert(0, "Probe_ID", [f"p{i}" for i in range(10)])
-
-    z = zscore_by_probe(df)
-    z_data = z.iloc[:, 1:].values
-
-    # Se z-score por LINHA (probe ao longo de samples): cada linha tem mean≈0, std≈1
-    row_means = z_data.mean(axis=1)
-    row_stds = z_data.std(axis=1)
-
-    # Se z-score por COLUNA (sample ao longo de probes): cada coluna tem mean≈0, std≈1
-    col_means = z_data.mean(axis=0)
-    col_stds = z_data.std(axis=0)
+    row_means, row_stds = z.mean(axis=1), z.std(axis=1, ddof=1)
+    col_means, col_stds = z.mean(axis=0), z.std(axis=0, ddof=1)
 
     by_row = np.allclose(row_means, 0, atol=1e-9) and np.allclose(row_stds, 1, atol=0.01)
     by_col = np.allclose(col_means, 0, atol=1e-9) and np.allclose(col_stds, 1, atol=0.01)
 
-    is_by_probe = by_row and not by_col
-    print(f"\n  por LINHA (probe): mean={row_means.mean():.4f}, std={row_stds.mean():.4f}")
-    print(f"  por COLUNA (sample): mean={col_means.mean():.4f}, std={col_stds.mean():.4f}")
+    # mu/sd devem ser Series indexadas por Probe_ID (reaplicação por nome, não posição)
+    indexed_by_probe = list(mu.index) == list(train.index) and mu.index.name == "Probe_ID"
 
-    # CIENTIFICAMENTE: para Müller et al. 2016 (ComBat workflow), a normalização
-    # padrão é por feature (probe), porque centraliza cada miRNA na sua própria
-    # média. Isso é o esperado.
+    passed = by_row and not by_col and indexed_by_probe
     report(
-        "F.1 zscore_by_probe normaliza por LINHA (probe ao longo de samples)",
-        is_by_probe,
-        f"by_row={by_row}, by_col={by_col}. "
-        f"normalize.py:zscore_by_probe linhas 21-26 (np.nanmean/std com axis=1, keepdims=True). "
-        f"DECISÃO CIENTÍFICA: para microarray miRNA, z-score por PROBE é a convenção "
-        f"em ComBat workflows (Müller 2016) — cada miRNA é re-centrado em sua própria média.",
+        "F.1 fit_zscore/apply_zscore normalizam por LINHA (probe), mu/sd por Probe_ID",
+        passed,
+        f"by_row={by_row}, by_col={by_col}, indexado_por_Probe_ID={indexed_by_probe}. "
+        f"z-score por PROBE é a convenção em ComBat workflows (cada miRNA re-centrado "
+        f"na própria média), com mu/sd aprendidos só no treino.",
     )
 
 
-# ─── F.2: batch label exato no ComBat ───────────────────────────────
+# ─── F.2: ComBat usa batch_col='batch' e class_col='class_label' ─────
 def test_f2_combat_batch():
-    """Inspeciona a chamada do ComBat para ver qual coluna vira batch."""
-    src = inspect.getsource(apply_combat)
-    print("\n[fonte de apply_combat] (trecho relevante):")
-    for line in src.split("\n"):
-        line_l = line.strip().lower()
-        if "batch_col" in line_l or "neurocombat(" in line_l or "covars" in line_l:
-            print(f"    {line}")
-    # batch_col default = "batch"
-    sig = inspect.signature(apply_combat)
+    sig = inspect.signature(combat_fit)
     default_batch = sig.parameters["batch_col"].default
     default_class = sig.parameters["class_col"].default
-    passed = default_batch == "batch" and default_class == "class_label"
+
+    src = inspect.getsource(combat_fit)
+    uses_categorical = "categorical_cols=[class_col]" in src.replace(" ", "")
+
+    passed = default_batch == "batch" and default_class == "class_label" and uses_categorical
     report(
-        "F.2 ComBat usa batch_col='batch' e class_col='class_label'",
+        "F.2 combat_fit usa batch_col='batch', class_col='class_label' (mod=classe)",
         passed,
-        f"default batch_col={default_batch!r}, class_col={default_class!r}. "
-        f"O CONTEÚDO da coluna 'batch' é o dataset_id (GSE85589, GSE59856) "
-        f"definido em features.py:build_sample_annotation linha 92 ('batch': dataset_id). "
-        f"normalize.py:apply_combat linhas 67-72 (chamada neuroCombat com covars dict)",
+        f"default batch_col={default_batch!r}, class_col={default_class!r}, "
+        f"categorical_cols=[class_col]={uses_categorical}. "
+        f"O conteúdo de 'batch' é o dataset_id (features.py:build_sample_annotation).",
     )
 
 
-# ─── F.3: ComBat com batch de 1 amostra ─────────────────────────────
-def test_f3_combat_single_sample_batch():
-    """Se um batch tiver apenas 1 amostra, ComBat falha?"""
-    rng = np.random.default_rng(0)
-    n_probes = 50
-    expr_data = rng.uniform(2, 12, size=(n_probes, 5))
-    expr = pd.DataFrame(expr_data, columns=["GSM1", "GSM2", "GSM3", "GSM4", "GSM5"])
-    expr.insert(0, "Probe_ID", [f"p{i}" for i in range(n_probes)])
+# ─── F.3: ComBat fit no treino + apply no teste (batch presente) ─────
+def test_f3_combat_fit_apply():
+    """Fit no treino (2 batches) e apply no teste cujo batch existe no treino.
+    Saída do teste deve ter shape correto e sem NaN."""
+    cols_tr = [f"GSM{i}" for i in range(10)]
+    cols_te = [f"GSM{i}" for i in range(10, 16)]
+    train = _expr(50, cols_tr, seed=0)
+    test = _expr(50, cols_te, seed=1)
 
-    # batch tem 1 amostra apenas no batch_B
-    annot = pd.DataFrame({
-        "sample_id": ["GSM1", "GSM2", "GSM3", "GSM4", "GSM5"],
-        "batch": ["A", "A", "A", "A", "B"],  # batch B com 1 amostra
-        "class_label": ["PDAC", "PDAC", "Control", "Control", "Control"],
+    annot_tr = pd.DataFrame({
+        "sample_id": cols_tr,
+        "batch": ["A", "A", "A", "A", "A", "B", "B", "B", "B", "B"],
+        "class_label": ["PDAC", "Control"] * 5,
+    })
+    annot_te = pd.DataFrame({
+        "sample_id": cols_te,
+        "batch": ["A", "A", "A", "B", "B", "B"],  # batches já vistos no treino
+        "class_label": ["PDAC", "Control", "PDAC", "Control", "PDAC", "Control"],
     })
 
     error_msg = None
-    out = None
     try:
-        out = apply_combat(expr, annot)
+        train_corr, estimates, train_med = combat_fit(train, annot_tr)
+        test_corr = combat_apply(test, annot_te, train_corr.index, estimates, train_med)
+        ok_shape = test_corr.shape == (train_corr.shape[0], len(cols_te))
+        has_nan = bool(np.isnan(test_corr.values).any())
     except Exception as e:
         error_msg = f"{type(e).__name__}: {e}"
+        ok_shape = has_nan = False
 
-    if error_msg:
-        verdict = f"FALHA com {error_msg}"
-        passed = "batch" in error_msg.lower() or "sample" in error_msg.lower()
-    else:
-        # Se não falhou, verificar se output é razoável
-        out_data = out.iloc[:, 1:].values
-        has_nan = np.isnan(out_data).any()
-        verdict = f"NÃO falhou; output shape {out.shape}, has_nan={has_nan}"
-        passed = not has_nan
-
+    passed = error_msg is None and ok_shape and not has_nan
     report(
-        "F.3 ComBat com batch de 1 amostra",
+        "F.3 combat_fit(treino) + combat_apply(teste) — batch visto no treino",
         passed,
-        f"{verdict}. "
-        f"normalize.py:apply_combat NÃO valida tamanho de batch antes de chamar neuroCombat. "
-        f"Confiança recai na biblioteca neuroCombat (linha 67-72).",
+        (f"FALHA: {error_msg}" if error_msg else
+         f"shape teste OK={ok_shape}, has_nan={has_nan}. "
+         f"Teste harmonizado via neuroCombatFromTraining com estimativas do treino."),
     )
 
 
 if __name__ == "__main__":
     print("=" * 70)
-    print(" MÓDULO F — normalize.py")
+    print(" MÓDULO F — normalize.py (fit/apply sem vazamento)")
     print("=" * 70)
+    test_f0_legacy_removed()
     test_f1_zscore_axis()
     test_f2_combat_batch()
-    test_f3_combat_single_sample_batch()
+    test_f3_combat_fit_apply()

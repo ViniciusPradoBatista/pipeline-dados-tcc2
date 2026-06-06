@@ -87,6 +87,15 @@ def _read_expression_txt(path: str) -> Tuple[pd.DataFrame, pd.DataFrame, List[st
     df.rename(columns=rename_map, inplace=True)
     gsm_cols = [rename_map[c] for c in gsm_cols_raw]
 
+    # Fail-loud: 0 colunas GSM após o header ID_REF indica arquivo malformado
+    # (ex: separador não-tab). Melhor erro descritivo que falha silenciosa (0 amostras).
+    if not gsm_cols:
+        raise ValueError(
+            f"Nenhuma coluna de amostra (GSM\\d+) detectada após o header ID_REF em "
+            f"{Path(path).name}. O arquivo pode não ser tab-delimitado ou estar corrompido. "
+            f"Colunas encontradas: {list(df.columns)[:5]}"
+        )
+
     expr_text = df[["Probe_ID"] + gsm_cols].copy()
     expr_num = expr_text.copy()
 

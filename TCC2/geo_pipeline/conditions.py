@@ -339,5 +339,16 @@ def filter_samples_by_conditions(
             )
 
     filtered = meta_df.loc[mask].copy()
+
+    # Fail-loud: zero matches (mesmo após o fallback que varre todas as colunas)
+    # quase sempre indica condição mal-digitada ou ausente neste dataset. Erguer
+    # erro descritivo é melhor que devolver DataFrame vazio silenciosamente.
+    if filtered.empty:
+        raise ValueError(
+            f"Nenhuma amostra corresponde às condições {conditions} neste dataset "
+            f"(nem no fallback de varredura completa). Verifique a grafia das condições "
+            f"ou se elas existem neste dataset."
+        )
+
     log.info(f"Filtered: {filtered.shape[0]} samples for conditions {conditions}")
     return filtered

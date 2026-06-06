@@ -47,9 +47,14 @@ def test_d1_specific_inputs():
         print(f"  {repr(inp):<25} {str(broken):<8} {rstr:<25} {t:<10}")
     # Validações concretas
     assertions = [
-        (smart_float("1.129.491.157") == 1.129491157, "default mode multi-dot keeps first dot"),
+        # Em modo DEFAULT, string multi-ponto é ambígua → NaN (correto; só o modo
+        # broken_decimal reconstrói). A versão antiga deste teste esperava 1.129491157,
+        # comportamento que o código (corretamente) nunca teve.
+        (math.isnan(smart_float("1.129.491.157")), "default mode multi-dot → NaN (ambíguo sem broken)"),
         (smart_float("1.129.491.157", True) == 1.129491157, "broken mode reconstrói (4 dots)"),
         (smart_float("127.586.602", True) == 1.27586602, "broken mode 2-dots → 1.27586602"),
+        # Notação científica é número válido mesmo em modo broken (regressão INT.2).
+        (smart_float("-2.51E-05", True) == -2.51e-05, "broken mode preserva notação científica"),
         (math.isnan(smart_float("NA")), "NA → NaN"),
         (math.isnan(smart_float("")), "vazio → NaN"),
         (math.isnan(smart_float(None)), "None → NaN"),

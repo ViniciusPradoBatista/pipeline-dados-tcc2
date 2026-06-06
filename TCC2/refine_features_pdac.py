@@ -54,8 +54,15 @@ log = logging.getLogger("feature_refinement")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Feature Selection for PDAC miRNA Data")
 
-    parser.add_argument("--expr-path", required=True, type=str,
-                        help="Path to the merged expression CSV file.")
+    # O split treino/teste é feito no Estágio 1 (geo_mirna_pipeline.py), que entrega
+    # base_treino.csv e base_teste.csv já normalizados sem vazamento. Este script
+    # apenas CONSOME esse split (--train-path / --test-path).
+    parser.add_argument("--train-path", default=None, type=str,
+                        help="Path to base_treino.csv (expression CSV, Probe_ID × samples).")
+    parser.add_argument("--test-path", default=None, type=str,
+                        help="Path to base_teste.csv (expression CSV, Probe_ID × samples).")
+    parser.add_argument("--expr-path", default=None, type=str,
+                        help="[LEGADO] Matriz única; split interno 80/20. Use --train-path/--test-path.")
     parser.add_argument("--annot-path", required=True, type=str,
                         help="Path to the sample annotation CSV file.")
     parser.add_argument("--output-dir", required=True, type=str,
@@ -136,6 +143,30 @@ def load_and_align_data(
 
     log.info(f"Initial alignment complete. {X.shape[0]} samples, {X.shape[1]} features.")
     return X, y
+
+
+def load_presplit_data(
+    train_path: str,
+    test_path: str,
+    annot_path: str,
+    target_col: str,
+    pos_class: str,
+    neg_class: str,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+    """Loads the train/test split produced by Stage 1 (no internal re-split).
+
+    Both files share the same annotation; ``load_and_align_data`` filters by
+    sample_id, so each call keeps only the samples present in that file.
+    The test feature columns are reindexed to the train columns to guarantee
+    identical feature ordering.
+    """
+    X_train, y_train = load_and_align_data(
+        train_path, annot_path, target_col, pos_class, neg_class
+    )
+    X_test, y_test = load_and_align_data(
+        test_path, annot_path, target_col, pos_class, neg_class
+    )
+    return X_train, X_test, y_train, y_test
 
 
 def validate_data(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
@@ -312,38 +343,55 @@ def main():
     log.info("=" * 60)
     log.info("  Starting Downstream Feature Refinement Pipeline")
     log.info("=" * 60)
-    log.info(f"Expression: {args.expr_path}")
     log.info(f"Annotation: {args.annot_path}")
     log.info(f"Output Dir: {out_dir}")
     log.info(f"Data Mode:  Z-Score={args.use_zscore}, ComBat={args.use_combat}")
-    log.info(f"Test size:  {args.test_size*100:.0f}% (holdout estratificado)")
-    log.info("=" * 60)
 
-    # ── 1. Load Data ──
-    X_raw, y = load_and_align_data(
-        args.expr_path,
-        args.annot_path,
-        args.target_col,
-        args.positive_class,
-        args.negative_class
-    )
+    use_presplit = bool(args.train_path and args.test_path)
 
-    initial_features = X_raw.shape[1]
-    pdac_count = int((y == 1).sum())
-    control_count = int((y == 0).sum())
+    if use_presplit:
+        # ── Estágio 1 já fez o split sem vazamento — apenas consumir ──
+        log.info(f"Train: {args.train_path}")
+        log.info(f"Test:  {args.test_path}")
+        log.info("Usando split do Estágio 1 (sem re-split interno).")
+        log.info("=" * 60)
+
+        X_train_raw, X_test_raw, y_train, y_test = load_presplit_data(
+            args.train_path, args.test_path, args.annot_path,
+            args.target_col, args.positive_class, args.negative_class,
+        )
+        pdac_count = int((y_train == 1).sum()) + int((y_test == 1).sum())
+        control_count = int((y_train == 0).sum()) + int((y_test == 0).sum())
+        initial_features = X_train_raw.shape[1]
+
+        # Validação/limpeza aprendida no TREINO; teste alinhado às mesmas colunas.
+        X_train = validate_data(X_train_raw, y_train)
+        X_test = X_test_raw.reindex(columns=X_train.columns)
+    else:
+        # ── Modo LEGADO: matriz única + split interno (mantido p/ compatibilidade) ──
+        if not args.expr_path:
+            log.error("Forneça --train-path/--test-path (recomendado) ou --expr-path (legado).")
+            sys.exit(1)
+        log.info(f"Expression: {args.expr_path}")
+        log.info(f"Test size:  {args.test_size*100:.0f}% (holdout estratificado)")
+        log.info("=" * 60)
+
+        X_raw, y = load_and_align_data(
+            args.expr_path, args.annot_path,
+            args.target_col, args.positive_class, args.negative_class,
+        )
+        initial_features = X_raw.shape[1]
+        pdac_count = int((y == 1).sum())
+        control_count = int((y == 0).sum())
+        X = validate_data(X_raw, y)
+
+        log.info("── Split estratificado 80/20 (evita data leakage) ──")
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=args.test_size,
+            random_state=args.random_state, stratify=y,
+        )
+
     log.info(f"Class distribution -> PDAC (1): {pdac_count}, Control (0): {control_count}")
-
-    # ── 2. Validate ──
-    X = validate_data(X_raw, y)
-
-    # ── 3. Holdout Split (ANTES de qualquer seleção de features) ──
-    log.info("── Split estratificado 80/20 (evita data leakage) ──")
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y,
-        test_size=args.test_size,
-        random_state=args.random_state,
-        stratify=y,
-    )
     log.info(
         f"Train: {X_train.shape[0]} amostras "
         f"(PDAC={int((y_train==1).sum())}, Control={int((y_train==0).sum())})"
@@ -437,7 +485,7 @@ def main():
         f.write(report)
 
     summary = {
-        "samples_total": int(X.shape[0]),
+        "samples_total": int(X_train.shape[0] + X_test.shape[0]),
         "samples_pdac": pdac_count,
         "samples_control": control_count,
         "samples_train": int(X_train.shape[0]),

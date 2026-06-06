@@ -147,7 +147,12 @@ def parse_args() -> argparse.Namespace:
         description="Feature Selection with LASSO for PDAC miRNA Data",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--expr-path", default=None, type=str)
+    parser.add_argument("--train-path", default=None, type=str,
+                        help="base_treino.csv (expression CSV, Probe_ID × samples).")
+    parser.add_argument("--test-path", default=None, type=str,
+                        help="base_teste.csv (expression CSV, Probe_ID × samples).")
+    parser.add_argument("--expr-path", default=None, type=str,
+                        help="[LEGADO] Matriz única; split interno. Use --train-path/--test-path.")
     parser.add_argument("--annot-path", default=None, type=str)
     parser.add_argument("--output-dir", default=None, type=str)
     parser.add_argument("--use-combat", action="store_true")
@@ -209,6 +214,20 @@ def load_and_align_data(
 
     log.info(f"Aligned: {X.shape[0]} samples x {X.shape[1]} features")
     return X, y
+
+
+def load_presplit_data(
+    train_path: str, test_path: str, annot_path: str,
+    target_col: str, pos_class: str, neg_class: str,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+    """Loads the Stage-1 train/test split (no internal re-split)."""
+    X_train, y_train = load_and_align_data(
+        train_path, annot_path, target_col, pos_class, neg_class
+    )
+    X_test, y_test = load_and_align_data(
+        test_path, annot_path, target_col, pos_class, neg_class
+    )
+    return X_train, X_test, y_train, y_test
 
 
 def validate_data(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
@@ -425,7 +444,9 @@ def lasso_cv_regression(
 def main():
     args = parse_args()
 
-    if not args.expr_path:
+    use_presplit = bool(args.train_path and args.test_path)
+
+    if not use_presplit and not args.expr_path:
         print("\n" + "=" * 55)
         print("  LASSO Feature Selection for PDAC miRNA")
         print("=" * 55)
@@ -437,24 +458,29 @@ def main():
     if not args.output_dir:
         args.output_dir = interactive_select_output()
 
-    if not Path(args.expr_path).exists():
-        log.error(f"File not found: {args.expr_path}")
-        sys.exit(1)
-    if not Path(args.annot_path).exists():
-        log.error(f"File not found: {args.annot_path}")
-        sys.exit(1)
+    # Validar existência dos arquivos de entrada
+    paths_to_check = (
+        [args.train_path, args.test_path] if use_presplit else [args.expr_path]
+    ) + [args.annot_path]
+    for p in paths_to_check:
+        if not p or not Path(p).exists():
+            log.error(f"File not found: {p}")
+            sys.exit(1)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*55}")
-    print(f"  Expressao : {Path(args.expr_path).name}")
+    if use_presplit:
+        print(f"  Train     : {Path(args.train_path).name}")
+        print(f"  Test      : {Path(args.test_path).name}")
+    else:
+        print(f"  Expressao : {Path(args.expr_path).name}")
     print(f"  Annotation: {Path(args.annot_path).name}")
     print(f"  Saida     : {out_dir.absolute()}")
     print(f"  LASSO mode: {args.lasso_mode}")
     print(f"  CV folds  : {args.cv_folds}")
     print(f"  Z-Score   : {args.use_zscore}")
-    print(f"  Test size : {args.test_size*100:.0f}% holdout estratificado")
     print(f"{'='*55}")
 
     log.info("=" * 60)
@@ -462,26 +488,36 @@ def main():
     log.info("=" * 60)
 
     # ── 1. Load ──
-    X_raw, y = load_and_align_data(
-        args.expr_path, args.annot_path,
-        args.target_col, args.positive_class, args.negative_class,
-    )
-    initial_features = X_raw.shape[1]
-    n_pdac = int((y == 1).sum())
-    n_ctrl = int((y == 0).sum())
-    log.info(f"Classes: PDAC={n_pdac}, Control={n_ctrl}")
+    if use_presplit:
+        log.info("Usando split do Estágio 1 (sem re-split interno).")
+        X_train_raw, X_test_raw, y_train, y_test = load_presplit_data(
+            args.train_path, args.test_path, args.annot_path,
+            args.target_col, args.positive_class, args.negative_class,
+        )
+        n_pdac = int((y_train == 1).sum()) + int((y_test == 1).sum())
+        n_ctrl = int((y_train == 0).sum()) + int((y_test == 0).sum())
+        initial_features = X_train_raw.shape[1]
+        log.info(f"Classes: PDAC={n_pdac}, Control={n_ctrl}")
 
-    # ── 2. Validate ──
-    X = validate_data(X_raw, y)
+        X_train = validate_data(X_train_raw, y_train)
+        X_test = X_test_raw.reindex(columns=X_train.columns)
+    else:
+        X_raw, y = load_and_align_data(
+            args.expr_path, args.annot_path,
+            args.target_col, args.positive_class, args.negative_class,
+        )
+        initial_features = X_raw.shape[1]
+        n_pdac = int((y == 1).sum())
+        n_ctrl = int((y == 0).sum())
+        log.info(f"Classes: PDAC={n_pdac}, Control={n_ctrl}")
 
-    # ── 3. Holdout Split (ANTES de qualquer seleção de features) ──
-    log.info("── Split estratificado 80/20 (evita data leakage) ──")
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y,
-        test_size=args.test_size,
-        random_state=args.random_state,
-        stratify=y,
-    )
+        X = validate_data(X_raw, y)
+
+        log.info("── Split estratificado 80/20 (evita data leakage) ──")
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=args.test_size,
+            random_state=args.random_state, stratify=y,
+        )
     log.info(
         f"Train: {X_train.shape[0]} amostras "
         f"(PDAC={int((y_train==1).sum())}, Control={int((y_train==0).sum())})"
@@ -579,7 +615,7 @@ def main():
         f.write(report)
 
     summary = {
-        "samples_total": int(X.shape[0]),
+        "samples_total": int(X_train.shape[0] + X_test.shape[0]),
         "samples_pdac": n_pdac,
         "samples_control": n_ctrl,
         "samples_train": int(X_train.shape[0]),

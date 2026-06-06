@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import logging
 import subprocess
@@ -28,6 +29,14 @@ import textwrap
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+# Fix Windows console encoding for box-drawing/unicode (─ ═) — mesmo guard do Estágio 1.
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # ── optional tkinter ──────────────────────────────────────────────────
 try:
@@ -55,12 +64,15 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 BORUTA_SCRIPT = SCRIPT_DIR / "refine_features_pdac.py"
 LASSO_SCRIPT  = SCRIPT_DIR / "refine_features_lasso.py"
 
+# O Estágio 1 entrega o split treino/teste já normalizado sem vazamento.
+# A fonte preferencial do Estágio 2 passa a ser base_treino.csv (+ base_teste.csv).
+# merged_expression_combat.csv permanece apenas como artefato de PCA — NÃO usar
+# como entrada do Estágio 2 (contém treino+teste juntos).
 _EXPR_PRIORITY = [
-    "merged_expression_combat.csv",
-    "merged_expression_raw.csv",
-    "merged_expression_combat_zscore.csv",
-    "merged_expression_zscore.csv",
+    "base_treino.csv",
+    "merged_expression_raw.csv",  # legado / fallback (split interno)
 ]
+_TEST_NAME = "base_teste.csv"
 _ANNOT_NAME = "merged_sample_annotation.csv"
 
 SEPARATOR = "─" * 56
@@ -287,7 +299,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # Paths
-    parser.add_argument("--expr-path",  default=None, help="Arquivo de expressao (CSV)")
+    parser.add_argument("--expr-path",  default=None, help="Treino: base_treino.csv (CSV)")
+    parser.add_argument("--test-path",  default=None, help="Teste: base_teste.csv (CSV). Se omitido, deriva ao lado do --expr-path.")
     parser.add_argument("--annot-path", default=None, help="Arquivo de annotation (CSV)")
     parser.add_argument("--output-dir", default=None, help="Pasta raiz de saida")
 
@@ -330,6 +343,7 @@ def build_parser() -> argparse.ArgumentParser:
 def build_config_from_args(args: argparse.Namespace) -> dict:
     return {
         "expr_path":      args.expr_path,
+        "test_path":      args.test_path,
         "annot_path":     args.annot_path,
         "output_dir":     args.output_dir,
         "mode":           args.mode,
@@ -379,21 +393,30 @@ def fill_config_interactively(cfg: dict) -> dict:
                 break
 
         print(f"\n{THICK_SEP}")
-        print("  DICA — Arquivos de expressao suportados:")
-        print("    • merged_expression_combat.csv      ← prioridade 1 (recomendado)")
-        print("    • merged_expression_raw.csv         ← prioridade 2")
-        print("    • merged_expression_combat_zscore.csv")
-        print("    • merged_expression_zscore.csv      ← zscore (avancado)")
+        print("  DICA — Arquivo de TREINO suportado (entrada do Estágio 2):")
+        print("    • base_treino.csv     ← prioridade 1 (split do Estágio 1, sem vazamento)")
+        print("    • merged_expression_raw.csv  ← legado (faz split interno 80/20)")
         print(THICK_SEP)
-        cfg["expr_path"] = interactive_select_file("Arquivo de expressao (CSV)", hint_dir)
+        cfg["expr_path"] = interactive_select_file("Arquivo de TREINO (base_treino.csv)", hint_dir)
 
-        # Auto-detect zscore flag from filename
         name = Path(cfg["expr_path"]).name.lower()
-        if "zscore" in name and not cfg["use_zscore"]:
-            if interactive_yes_no("  Arquivo parece ser Z-scored. Ativar --use-zscore?", default=True):
-                cfg["use_zscore"] = True
-        if "combat" in name and not cfg["use_combat"]:
+        # base_treino.csv vem do Estágio 1: ComBat + z-score já aplicados sem vazamento.
+        if "base_treino" in name:
             cfg["use_combat"] = True
+            cfg["use_zscore"] = True
+        else:
+            if "zscore" in name and not cfg["use_zscore"]:
+                if interactive_yes_no("  Arquivo parece ser Z-scored. Ativar --use-zscore?", default=True):
+                    cfg["use_zscore"] = True
+            if "combat" in name and not cfg["use_combat"]:
+                cfg["use_combat"] = True
+
+    # ── Test file (base_teste.csv) — deriva ao lado do treino ──
+    if not cfg.get("test_path") and cfg["expr_path"]:
+        sibling = Path(cfg["expr_path"]).parent / _TEST_NAME
+        if Path(cfg["expr_path"]).name.lower().startswith("base_treino") and sibling.exists():
+            cfg["test_path"] = str(sibling)
+            print(f"  Teste detectado: {sibling.name} (split do Estágio 1)")
 
     # ── Annotation file ──
     if not cfg["annot_path"]:
@@ -442,7 +465,11 @@ def print_config_summary(cfg: dict) -> None:
     _print_header("Resumo da Configuracao")
     mode_label = {"boruta": "Boruta", "lasso": "LASSO", "both": "Boruta + LASSO"}
     print(f"  Modo            : {mode_label.get(cfg['mode'], cfg['mode'])}")
-    print(f"  Expressao       : {Path(cfg['expr_path']).name}")
+    if cfg.get("test_path"):
+        print(f"  Treino          : {Path(cfg['expr_path']).name}")
+        print(f"  Teste           : {Path(cfg['test_path']).name}  (split do Estágio 1)")
+    else:
+        print(f"  Expressao       : {Path(cfg['expr_path']).name}  (split interno 80/20)")
     print(f"  Annotation      : {Path(cfg['annot_path']).name}")
     print(f"  Pasta de saida  : {Path(cfg['output_dir']).resolve()}")
     print(f"  ComBat          : {'Sim' if cfg['use_combat'] else 'Nao'}")
@@ -502,10 +529,23 @@ def _stream_subprocess(cmd: List[str], label: str) -> Tuple[int, List[str]]:
 
 
 def _build_common_args(cfg: dict) -> List[str]:
-    """Build CLI args shared by both downstream scripts."""
-    args = [
-        "--expr-path",      cfg["expr_path"],
-        "--annot-path",     cfg["annot_path"],
+    """Build CLI args shared by both downstream scripts.
+
+    Passa o split do Estágio 1 (--train-path/--test-path). Mantém compatibilidade
+    com o modo legado (--expr-path) caso test_path não esteja disponível.
+    """
+    if cfg.get("test_path"):
+        args = [
+            "--train-path", cfg["expr_path"],
+            "--test-path",  cfg["test_path"],
+            "--annot-path", cfg["annot_path"],
+        ]
+    else:
+        args = [
+            "--expr-path",  cfg["expr_path"],
+            "--annot-path", cfg["annot_path"],
+        ]
+    args += [
         "--target-col",     cfg["target_col"],
         "--positive-class", cfg["positive_class"],
         "--negative-class", cfg["negative_class"],
@@ -832,14 +872,33 @@ def main() -> None:
     else:
         # ── CLI mode ──
         log.info("Modo CLI detectado — pulando prompts interativos.")
+        # Deriva o teste ao lado do treino quando não informado explicitamente.
+        if not cfg.get("test_path") and cfg["expr_path"]:
+            sibling = Path(cfg["expr_path"]).parent / _TEST_NAME
+            if Path(cfg["expr_path"]).name.lower().startswith("base_treino") and sibling.exists():
+                cfg["test_path"] = str(sibling)
+                log.info(f"Teste derivado: {sibling} (split do Estágio 1)")
+        # base_treino vem normalizado do Estágio 1 → marcar combat/zscore.
+        if cfg["expr_path"] and Path(cfg["expr_path"]).name.lower().startswith("base_treino"):
+            cfg["use_combat"] = True
+            cfg["use_zscore"] = True
         print_config_summary(cfg)
 
     # ── Validate input files ──
-    for key, label in [("expr_path", "expressao"), ("annot_path", "annotation")]:
+    files_to_check = [("expr_path", "treino"), ("annot_path", "annotation")]
+    if cfg.get("test_path"):
+        files_to_check.append(("test_path", "teste"))
+    for key, label in files_to_check:
         path = Path(cfg[key])
         if not path.exists():
             log.error(f"Arquivo de {label} nao encontrado: {path}")
             sys.exit(1)
+
+    if not cfg.get("test_path"):
+        log.warning(
+            "Sem --test-path / base_teste.csv: usando modo LEGADO (split interno 80/20). "
+            "Para o fluxo sem vazamento, aponte --expr-path para base_treino.csv do Estágio 1."
+        )
 
     # ── Validate downstream scripts ──
     for script, name in [(BORUTA_SCRIPT, "Boruta"), (LASSO_SCRIPT, "LASSO")]:

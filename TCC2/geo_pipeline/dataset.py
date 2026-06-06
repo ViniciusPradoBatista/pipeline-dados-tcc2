@@ -264,6 +264,17 @@ def merge_datasets(
         return pd.concat(parts, axis=1).reset_index()
 
     merged_raw = _merge_list(all_raw)
+
+    # Fail-loud: GSMs devem ser únicos por dataset e datasets distintos têm GSMs
+    # distintos. Colunas de amostra duplicadas após o concat indicam o MESMO dataset
+    # passado 2× ou colisão de IDs — pd.concat(axis=1) não deduplica.
+    dup_cols = merged_raw.columns[merged_raw.columns.duplicated()].tolist()
+    if dup_cols:
+        raise ValueError(
+            f"merge_datasets: colunas de amostra duplicadas entre datasets: "
+            f"{dup_cols[:10]}. Verifique se o mesmo dataset foi passado mais de uma vez."
+        )
+
     merged_annot = pd.concat(all_annot, ignore_index=True)
 
     output_dir.mkdir(parents=True, exist_ok=True)

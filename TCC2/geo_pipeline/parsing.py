@@ -22,6 +22,14 @@ def smart_float(x, broken_decimal: bool = False) -> float:
         return np.nan
 
     if broken_decimal:
+        # Notação científica (ex: "-2.51E-05") é um número válido e NÃO foi vítima do
+        # locale quebrado — converter direto. Reconstruir dígito-a-dígito ("251E-05")
+        # produziria NaN e perderia o valor silenciosamente.
+        if "e" in s.lower():
+            try:
+                return float(s)
+            except ValueError:
+                return np.nan
         sign = -1.0 if s.startswith("-") else 1.0
         digits = s.lstrip("-").replace(".", "").replace(",", "")
         if not digits.isdigit():

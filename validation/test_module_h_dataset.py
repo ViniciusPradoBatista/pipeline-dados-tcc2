@@ -36,6 +36,8 @@ def test_h1_pipeline_sequence():
     print("\n[SEQUÊNCIA] process_single_dataset:")
     for i, st in enumerate(steps, 1):
         print(f"  {i}. {st}")
+    # O passo de z-score POR DATASET foi REMOVIDO (z-score agora é fit-no-treino,
+    # global, no Estágio 1 — sem vazamento). Logo a sequência correta tem 8 marcadores.
     expected_order = [
         "STEP 1: Metadata",
         "STEP 2: Condition selection",
@@ -43,46 +45,56 @@ def test_h1_pipeline_sequence():
         "STEP 4: Cross-reference",
         "STEP 5: Scale inference",
         "STEP 6: Probe ID harmonization",
-        "STEP 7: Z-score",
-        "STEP 8: Sample annotation",
+        "STEP 7: Sample annotation",
         "SAVE",
     ]
-    actual_keywords = [
-        next((k for k in expected_order if k.split(":")[0] in s), s) for s in steps
-    ]
-    passed = len(steps) == 9
+    passed = len(steps) == 8
     report(
-        "H.1 process_single_dataset tem sequência de 9 passos esperada",
+        "H.1 process_single_dataset tem sequência de 8 passos (sem z-score per-dataset)",
         passed,
-        f"steps_found={len(steps)} (esperado 9). "
-        f"dataset.py:process_single_dataset linhas 32-179. "
-        f"ORDEM CRÍTICA: scale_inference (5) ANTES de probe_harmonization (6) e z-score (7) — correto.",
+        f"steps_found={len(steps)} (esperado 8). "
+        f"ORDEM CRÍTICA: scale_inference (5) ANTES de probe_harmonization (6) — correto. "
+        f"z-score per-dataset removido: normalização é fit-no-treino no Estágio 1.",
     )
 
 
-# ─── H.2: ordem normalize-then-merge vs merge-then-normalize ────────
-def test_h2_normalize_before_merge():
-    """Confirma: cada dataset é normalizado (z-score) ANTES da interseção/merge."""
+# ─── H.2: fluxo correto sem vazamento (merge → split → fit-no-treino) ───
+def test_h2_normalize_after_split():
+    """Confirma o fluxo correto e SEM vazamento:
+    - NÃO há z-score por dataset antes do merge (seria escala incompatível);
+    - a interseção dos miRNAs comuns ocorre no merge;
+    - no Estágio 1, o split vem ANTES de ComBat/z-score, ambos fit-no-treino.
+    """
     src_proc = inspect.getsource(process_single_dataset)
     src_merge = inspect.getsource(merge_datasets)
+    import geo_mirna_pipeline  # noqa: E402
+    src_stage1 = inspect.getsource(geo_mirna_pipeline.run_pipeline)
 
-    # process_single_dataset salva expression_merge_ready_zscore.csv (já z-scored)
-    saves_zscore = "expression_merge_ready_zscore.csv" in src_proc
-    # merge_datasets carrega esse arquivo
-    loads_zscore = "expression_merge_ready_zscore.csv" in src_merge
-    # Interseção é feita no merge (linha "common = ...intersection...")
+    src_nospace = src_stage1.replace(" ", "")
+
+    no_perdataset_zscore = "_zscore.csv" not in src_proc
     has_intersection = "intersection" in src_merge
+    fits_on_train = "combat_fit" in src_stage1 and "fit_zscore" in src_stage1
+    # ORDEM positiva (não só ausência do antigo): split → ComBat → z-score
+    split_before_combat = (
+        src_stage1.index("stratified_split_ids") < src_stage1.index("combat_fit")
+    )
+    combat_before_zscore = src_stage1.index("combat_fit") < src_stage1.index("fit_zscore")
+    # z-score é fitado sobre o TREINO JÁ corrigido pelo ComBat (train_corr), não cru
+    zscore_on_combat_corrected_train = "fit_zscore(train_corr)" in src_nospace
 
-    passed = saves_zscore and loads_zscore and has_intersection
+    passed = (
+        no_perdataset_zscore and has_intersection and fits_on_train
+        and split_before_combat and combat_before_zscore
+        and zscore_on_combat_corrected_train
+    )
     report(
-        "H.2 Normalização (z-score) é por dataset ANTES do merge/interseção",
+        "H.2 z-score é GLOBAL, pós-ComBat, só no TREINO (merge→split→ComBat→z-score)",
         passed,
-        f"process_single_dataset salva _zscore.csv per-dataset: {saves_zscore}. "
-        f"merge_datasets carrega _zscore.csv e intersecta: {loads_zscore}/{has_intersection}. "
-        f"FLUXO CONFIRMADO: zscore_by_probe roda em process_single (linha ~119) "
-        f"sobre o expr_merge per-dataset; depois merge_datasets pega .intersection() em "
-        f"linhas 215-217. Ordem: NORMALIZE per-dataset → INTERSECT comum → CONCAT. "
-        f"OBS: ComBat (em geo_mirna_pipeline.main) roda DEPOIS do merge, sobre expressão merged_raw.",
+        f"sem z-score per-dataset={no_perdataset_zscore}, interseção no merge={has_intersection}, "
+        f"split<ComBat={split_before_combat}, ComBat<z-score={combat_before_zscore}, "
+        f"z-score sobre train_corr (treino pós-ComBat)={zscore_on_combat_corrected_train}. "
+        f"Afirma o fluxo CORRETO positivamente, não apenas a remoção do z-score per-dataset.",
     )
 
 
@@ -154,6 +166,6 @@ if __name__ == "__main__":
     print(" MÓDULO H — dataset.py")
     print("=" * 70)
     test_h1_pipeline_sequence()
-    test_h2_normalize_before_merge()
+    test_h2_normalize_after_split()
     test_h3_merge_dedup()
     test_h4_extract_dataset_id()

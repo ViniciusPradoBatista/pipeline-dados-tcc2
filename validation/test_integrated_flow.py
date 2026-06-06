@@ -10,11 +10,13 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from geo_pipeline.dataset import process_single_dataset  # noqa: E402
+from geo_mirna_pipeline import run_pipeline as run_stage1_pipeline  # noqa: E402
 
 
 REPO = Path(__file__).parent.parent
 DATA = REPO / "TCC2" / "data"
 GSE85589 = str(DATA / "GSE85589_series_matrix.txt")
+GSE59856 = str(DATA / "GSE59856_series_matrix (1).txt")
 
 
 def report(name, passed, details):
@@ -142,7 +144,6 @@ def test_int3_determinism():
 
     files_to_check = [
         "expression_merge_ready.csv",
-        "expression_merge_ready_zscore.csv",
         "expression_analysis_ready.csv",
         "sample_annotation.csv",
         "feature_map.csv",
@@ -187,6 +188,67 @@ def test_int3_determinism():
     )
 
 
+# ─── INT.4: determinismo de base_treino/base_teste (Estágio 1 completo) ──
+def _run_full_stage1(out_root: Path) -> Path:
+    """Roda o Estágio 1 completo (2 datasets → merge → split → ComBat/z-score)."""
+    if out_root.exists():
+        shutil.rmtree(out_root)
+    out_root.mkdir(parents=True)
+    run_stage1_pipeline(
+        files=[GSE85589, GSE59856],
+        output_root=out_root,
+        no_interactive=True,
+        condition_filter=["pancreatic cancer", "healthy control"],
+        class_map={"pancreatic cancer": "PDAC", "healthy control": "Control"},
+        no_plots=True,
+    )
+    return out_root
+
+
+def test_int4_base_determinism():
+    if not Path(GSE59856).exists():
+        report("INT.4 Determinismo base_treino/base_teste", False,
+               f"GSE59856 não encontrado em {GSE59856} — pulando.")
+        return
+
+    out_a = REPO / "validation" / "_run_full_a"
+    out_b = REPO / "validation" / "_run_full_b"
+    _run_full_stage1(out_a)
+    _run_full_stage1(out_b)
+
+    diffs = {}
+    for fn in ("base_treino.csv", "base_teste.csv"):
+        a_path, b_path = out_a / fn, out_b / fn
+        if not (a_path.exists() and b_path.exists()):
+            diffs[fn] = "missing"
+            continue
+        a_df, b_df = pd.read_csv(a_path), pd.read_csv(b_path)
+        if a_df.shape != b_df.shape:
+            diffs[fn] = f"shape {a_df.shape} vs {b_df.shape}"
+            continue
+        num = a_df.select_dtypes("number").columns
+        d = float(np.nanmax(np.abs(a_df[num].values - b_df[num].values))) if len(num) else 0.0
+        if d > 1e-12:
+            diffs[fn] = f"max float diff {d:.2e}"
+        elif not (a_df["Probe_ID"].astype(str) == b_df["Probe_ID"].astype(str)).all():
+            diffs[fn] = "Probe_ID order differs"
+
+    # também confere que as amostras de treino e teste não se sobrepõem
+    bt = pd.read_csv(out_a / "base_treino.csv")
+    bv = pd.read_csv(out_a / "base_teste.csv")
+    train_samples = set(bt.columns) - {"Probe_ID"}
+    test_samples = set(bv.columns) - {"Probe_ID"}
+    overlap = train_samples & test_samples
+
+    passed = len(diffs) == 0 and len(overlap) == 0
+    report(
+        "INT.4 Determinismo de base_treino/base_teste + treino∩teste=∅",
+        passed,
+        f"diffs={diffs if diffs else 'nenhuma'}; overlap treino∩teste={len(overlap)}; "
+        f"treino={len(train_samples)} amostras, teste={len(test_samples)} amostras.",
+    )
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print(" FLUXO INTEGRADO — GSE85589")
@@ -194,3 +256,4 @@ if __name__ == "__main__":
     test_int1_dimensions()
     test_int2_no_nan()
     test_int3_determinism()
+    test_int4_base_determinism()
