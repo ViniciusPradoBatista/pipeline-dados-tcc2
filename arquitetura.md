@@ -1,6 +1,6 @@
-# CLAUDE.md
+# Arquitetura do Pipeline
 
-Referência técnica do projeto para o Claude Code. Descreve arquitetura, fluxo de dados e convenções deste pipeline de TCC.
+Referência técnica do projeto. Descreve arquitetura, fluxo de dados e convenções deste pipeline de TCC.
 
 ## O que é
 

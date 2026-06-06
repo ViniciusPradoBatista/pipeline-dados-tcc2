@@ -129,7 +129,7 @@ TCC2/
   data/                              # datasets GEO (GSE85589, GSE59856)
   requirements.txt
 validation/                          # testes por módulo + fluxo integrado
-CLAUDE.md                            # referência técnica detalhada
+arquitetura.md                       # referência técnica detalhada
 ```
 
 ## Código legado
