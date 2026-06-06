@@ -79,7 +79,7 @@ No modo `both`, o orquestrador gera `comparison/` com `comparison_report.txt` e 
 
 ## Dados
 
-`TCC2/data/`: `GSE85589_series_matrix.txt` e `GSE59856_series_matrix (1).txt` — datasets reais de miRNA de PDAC do GEO.
+`TCC2/data/`: `GSE85589_series_matrix.txt` e `GSE59856_series_matrix.txt` — datasets reais de miRNA de PDAC do GEO.
 
 ## Testes / validação
 
@@ -106,7 +106,7 @@ python TCC2/geo_mirna_pipeline.py
 # Estágio 1 — não-interativo, dois datasets
 python TCC2/geo_mirna_pipeline.py \
   "TCC2/data/GSE85589_series_matrix.txt" \
-  "TCC2/data/GSE59856_series_matrix (1).txt" \
+  "TCC2/data/GSE59856_series_matrix.txt" \
   --output-root ./out --no-interactive \
   --condition-filter "pancreatic cancer" "healthy control" \
   --class-map "pancreatic cancer=PDAC" "healthy control=Control"

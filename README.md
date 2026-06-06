@@ -75,7 +75,7 @@ python TCC2/geo_mirna_pipeline.py
 ```bash
 python TCC2/geo_mirna_pipeline.py \
   "TCC2/data/GSE85589_series_matrix.txt" \
-  "TCC2/data/GSE59856_series_matrix (1).txt" \
+  "TCC2/data/GSE59856_series_matrix.txt" \
   --output-root ./out --no-interactive \
   --condition-filter "pancreatic cancer" "healthy control" \
   --class-map "pancreatic cancer=PDAC" "healthy control=Control"

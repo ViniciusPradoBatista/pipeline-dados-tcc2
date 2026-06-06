@@ -16,7 +16,7 @@ from geo_pipeline.io_geo import detect_encoding, parse_series_metadata_tabular  
 REPO = Path(__file__).parent.parent
 DATA = REPO / "TCC2" / "data"
 GSE85589 = str(DATA / "GSE85589_series_matrix.txt")
-GSE59856 = str(DATA / "GSE59856_series_matrix (1).txt")
+GSE59856 = str(DATA / "GSE59856_series_matrix.txt")
 
 
 def report(name: str, passed: bool, details: str) -> None:

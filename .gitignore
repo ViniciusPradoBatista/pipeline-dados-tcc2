@@ -27,6 +27,7 @@ Thumbs.db
 # Pipeline outputs (gerados por execuções; não versionar)
 out/
 out_*/
+results_feature_selection/
 validation/_run_*/
 _conf/
 _out*/
@@ -34,6 +35,16 @@ _final/
 _acc/
 _chk/
 _v/
+
+# Artefatos gerados pelos estágios (regeneráveis; não versionar)
+base_treino.csv
+base_teste.csv
+combat_estimates.pkl
+zscore_params.csv
+merged_*.csv
+purity_metrics.csv
+split_composition.csv
+*.png
 
 # Logs
 *.log
