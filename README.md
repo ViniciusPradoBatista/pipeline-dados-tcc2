@@ -132,6 +132,15 @@ validation/                          # testes por módulo + fluxo integrado
 CLAUDE.md                            # referência técnica detalhada
 ```
 
+## Código legado
+
+`TCC2/app.py` é a versão monolítica inicial do pipeline, anterior à refatoração
+modular. Está fora do fluxo atual — nenhum módulo o importa e ele não é executado
+pelo pipeline. É mantido apenas como registro histórico da evolução do projeto.
+
+➡️ O pipeline atual é o pacote `geo_pipeline/` orquestrado por
+`geo_mirna_pipeline.py`. Use esse, não o `app.py`.
+
 ## Dados
 
 `TCC2/data/` contém dois Series Matrix reais de miRNA de PDAC: **GSE85589** e **GSE59856**.
@@ -147,24 +156,7 @@ python validation/test_module_a_io_geo.py   # ... até o módulo i
 
 O fluxo integrado inclui checagem de **determinismo** (duas execuções produzem saídas idênticas) e ausência de NaN nos dados processados.
 
-### Análises de robustez
-
-Scripts paralelos (leem artefatos do Estágio 1; não alteram o pipeline). Veja `docs/PIPELINE.md`.
-
-```bash
-# Confound de plataforma: a plataforma some após o ComBat?
-python validation/platform_confound_check.py --output-root ./out
-
-# Discriminação imune ao confound de plataforma (CV dentro do Toray)
-python validation/within_platform_eval.py --output-root ./out
-
-# Confound de coleta/scan-batch nos metadados GEO
-python validation/collection_batch_check.py \
-  --series-matrix "TCC2/data/GSE59856_series_matrix (1).txt" "TCC2/data/GSE85589_series_matrix.txt"
-```
-
-Achados (resumo honesto): o ComBat remove o efeito de batch **marginal**, mas a estrutura
-multivariada de plataforma persiste; a discriminação PDAC vs. saudável se sustenta **dentro
-de uma única plataforma** (não é só atalho de plataforma); porém em GSE59856 casos e
-controles estão em **lotes de array separados**, então o desempenho não pode ser atribuído à
-biologia pura por estatística isolada — a validação biológica é a evidência decisiva.
+> Durante o desenvolvimento foram conduzidas análises de robustez metodológica
+> (confound de plataforma, avaliação within-platform, confound de scan-batch). Elas
+> não fazem parte do pipeline — viram discussão no texto do TCC — e ficam preservadas
+> na tag git `snapshot-2026-06-06-robustez` e na cópia de segurança do projeto.

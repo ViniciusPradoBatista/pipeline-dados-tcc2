@@ -61,30 +61,18 @@ Reflete o código atual (pós-correção de vazamento). Etapas mapeadas para arq
   ► MODELO final (colega): treina em base_treino, avalia em base_teste intocado.
 
 ═══════════════════════════════════════════════════════════════════════════════
-  VALIDAÇÃO TRANSVERSAL (não altera o pipeline; lê artefatos)
+  VALIDAÇÃO TÉCNICA (não altera o pipeline; lê artefatos)
 ═══════════════════════════════════════════════════════════════════════════════
   • validation/test_module_a..j + test_integrated_flow → suíte 40/40
        J: anti-vazamento (perturbação atol=0 + IDs)
        INT.4: determinismo base_treino/teste + treino∩teste=∅
-  • validation/platform_confound_check.py → DIAGNÓSTICO de confound de plataforma
-       (treina p/ prever PLATAFORMA pré vs pós-ComBat; só no treino)
-       Resultado: ComBat removeu o efeito MARGINAL (Silhouette batch 0.88→~0;
-       |Δmédia| 2.61→0.037), mas estrutura multivariada de plataforma PERSISTE
-       (acurácia 1.00; PCA(2)→0.93). Como plataforma confunde com classe, a
-       discriminação PDAC é avaliada TAMBÉM within-platform (Toray) — ver
-       validation/within_platform_eval.py — para estimativa imune ao confound.
-  • validation/within_platform_eval.py → estimativa de discriminação imune ao
-       confound de PLATAFORMA (CV dentro do Toray; z-score e seleção fit-no-fold;
-       within vs. fundido; controle de permutação embutido).
-       Resultado: within-Toray ROC-AUC≈1.00 (leak-free; permutação→0.52) ≈ fundido
-       (0.99) → confound de PLATAFORMA não inflou. RESSALVA: ver collection_batch_check.
-  • validation/collection_batch_check.py → confound de COLETA/scan-batch nos
-       metadados GEO. Achado: em GSE59856 (Toray), casos e controles em LOTES DE
-       ARRAY separados (67 lotes, 0 mistos) → scan-batch perfeitamente confundido
-       com a classe, INSEPARÁVEL. Logo nem within-Toray atribui o AUC à biologia
-       pura → a validação biológica (concordância com biomarcadores) é decisiva.
 ═══════════════════════════════════════════════════════════════════════════════
 ```
+
+> As análises de robustez metodológica (confound de plataforma, avaliação
+> within-platform, confound de scan-batch) foram conduzidas durante a investigação
+> e **viram discussão no texto do TCC** — não fazem parte do código do pipeline.
+> Ficam preservadas na tag git `snapshot-2026-06-06-robustez` e na cópia de segurança.
 
 ## Versão Mermaid
 
@@ -128,7 +116,7 @@ flowchart TD
     end
 
     MODEL["Modelo final (colega):<br/>treina em base_treino, avalia em base_teste"]
-    VAL["Validacao transversal:<br/>suite 40/40<br/>platform_confound_check (DIAGNOSTICO de confound:<br/>ComBat removeu efeito marginal, residuo multivariado persiste)<br/>within_platform_eval (estimativa imune ao confound, Toray)"]
+    VAL["Validacao tecnica:<br/>suite 40/40 (modulos A-J + INT.1-4)<br/>anti-vazamento (J.1/J.2) + determinismo (INT.4)"]
 
     IN --> S1A --> G9
     B_TR --> S2
@@ -143,13 +131,3 @@ flowchart TD
 - A **fronteira anti-vazamento** é o passo 10 (split antes de qualquer ComBat/z-score).
 - ComBat e z-score são sempre **fit no treino / apply no teste**; mediana de imputação é train-only.
 - `merged_expression_combat.csv` é **só artefato de PCA** — não alimenta o Estágio 2.
-- O `platform_confound_check` é **diagnóstico de confound**, não prova de remoção de batch:
-  o ComBat removeu o efeito **marginal** (médias/variâncias por probe), mas a estrutura
-  **multivariada** de plataforma persiste e confunde com a classe — por isso existe a
-  avaliação **within-platform** (Toray) como estimativa imune ao confound **de plataforma**.
-- A `within_platform_eval` neutraliza o confound de **plataforma**, mas o
-  `collection_batch_check` revelou que em GSE59856 o **scan-batch** (lote de array) está
-  perfeitamente confundido com a classe (0 lotes mistos) — inseparável da biologia nestes
-  dados. Conclusão honesta: o desempenho não se atribui à biologia pura por evidência
-  estatística isolada; a **validação biológica** (miRNAs estáveis × biomarcadores de PDAC
-  na literatura) é a terceira evidência independente e decisiva.
