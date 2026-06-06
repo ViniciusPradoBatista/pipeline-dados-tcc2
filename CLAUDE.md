@@ -88,7 +88,15 @@ No modo `both`, o orquestrador gera `comparison/` com `comparison_report.txt` e 
 - `test_module_j_no_leakage.py` — **anti-vazamento**: J.1 prova por perturbação que `fit_normalization` ignora o teste (corromper o teste não muda mu/sd nem `estimates`, `atol=0`); J.2 confirma que nenhum ID de teste aparece em `combat_estimates`/`zscore_params`.
 - `test_integrated_flow.py` — fluxo ponta-a-ponta. INT.1–3 com GSE85589; **INT.4** roda o Estágio 1 completo (GSE85589+GSE59856) 2× e compara `base_treino.csv`/`base_teste.csv` byte-a-byte + verifica treino∩teste=∅.
 
-> Falhas pré-existentes (não relacionadas ao fluxo fit/apply): A.5, B.3, D.1, F.1, F.3, INT.2. Já falhavam antes desta refatoração.
+Suíte: 40/40 verde (`pytest --collect-only` confirma universo=40).
+
+### Análises de robustez (paralelas; leem artefatos, não alteram o pipeline)
+
+- `validation/platform_confound_check.py` — treina p/ prever a **plataforma** pré vs pós-ComBat. Achado: ComBat removeu o efeito **marginal** (|Δmédia| 2.61→0.037) mas a estrutura **multivariada** persiste (acc 1.00; PCA(2)→0.93). É diagnóstico de confound, não prova de remoção de batch.
+- `validation/within_platform_eval.py` — discriminação PDAC vs. saudável **dentro do Toray** (CV 5×5; z-score+seleção fit-no-fold; controle de permutação embutido; within vs. fundido). Resultado: ROC-AUC≈1.00 (leak-free) ≈ fundido (0.99) → confound de **plataforma** não inflou. Reporta 3 baldes de features (shared/boruta_only/lasso_only; `boruta_only` preservado).
+- `validation/collection_batch_check.py` — confound de **coleta/scan-batch** nos metadados GEO. Achado crítico: em GSE59856 casos e controles estão em **lotes de array separados** (67 lotes, 0 mistos) → scan-batch perfeitamente confundido com a classe, **inseparável**. GSE85589 não avaliável (tokens por amostra). ⇒ a **validação biológica** (miRNAs estáveis × biomarcadores de PDAC na literatura) é a terceira evidência independente e decisiva.
+
+> Falhas pré-existentes corrigidas nesta linha de trabalho (A.5, B.3, D.1, F.1, F.3, INT.2, G.3, H.1, H.2, H.3) — todas verdes agora.
 
 Padrão dos testes: imprimem `[PASSOU]`/`[FALHOU]` com detalhes; inserem `TCC2/` no `sys.path`.
 

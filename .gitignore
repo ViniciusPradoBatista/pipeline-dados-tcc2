@@ -28,6 +28,12 @@ Thumbs.db
 out/
 out_*/
 validation/_run_*/
+_conf/
+_out*/
+_final/
+_acc/
+_chk/
+_v/
 
 # Logs
 *.log
