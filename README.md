@@ -155,8 +155,3 @@ python validation/test_module_a_io_geo.py   # ... até o módulo i
 ```
 
 O fluxo integrado inclui checagem de **determinismo** (duas execuções produzem saídas idênticas) e ausência de NaN nos dados processados.
-
-> Durante o desenvolvimento foram conduzidas análises de robustez metodológica
-> (confound de plataforma, avaliação within-platform, confound de scan-batch). Elas
-> não fazem parte do pipeline — viram discussão no texto do TCC — e ficam preservadas
-> na tag git `snapshot-2026-06-06-robustez` e na cópia de segurança do projeto.
