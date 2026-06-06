@@ -151,7 +151,7 @@ Os scripts de teste rodam de forma standalone (sem pytest) e imprimem `[PASSOU]`
 
 ```bash
 python validation/test_integrated_flow.py
-python validation/test_module_a_io_geo.py   # ... até o módulo i
+python validation/test_module_a_io_geo.py   # ... até o módulo j
 ```
 
 O fluxo integrado inclui checagem de **determinismo** (duas execuções produzem saídas idênticas) e ausência de NaN nos dados processados.

@@ -284,14 +284,14 @@ def build_parser() -> argparse.ArgumentParser:
 
               # CLI direto — ambos os pipelines:
               python run_feature_refinement_system.py \\
-                --expr-path merged_expression_combat.csv \\
+                --expr-path base_treino.csv \\
                 --annot-path merged_sample_annotation.csv \\
                 --output-dir ./results_feature_selection \\
                 --mode both
 
               # Somente LASSO com modo lasso_cv:
               python run_feature_refinement_system.py \\
-                --expr-path merged_expression_combat.csv \\
+                --expr-path base_treino.csv \\
                 --annot-path merged_sample_annotation.csv \\
                 --output-dir ./results_lasso \\
                 --mode lasso --lasso-mode lasso_cv

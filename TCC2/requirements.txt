@@ -1,5 +1,6 @@
 boruta
 chardet
+joblib
 matplotlib
 neuroCombat
 numpy

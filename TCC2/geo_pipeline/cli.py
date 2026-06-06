@@ -77,11 +77,6 @@ Examples:
         help="Skip ComBat batch correction",
     )
     parser.add_argument(
-        "--zscore-only",
-        action="store_true",
-        help="Only do z-score merge, skip ComBat",
-    )
-    parser.add_argument(
         "--no-plots",
         action="store_true",
         help="Skip plot generation",
